@@ -1,0 +1,413 @@
+﻿using Andre.Formats;
+using SoulsFormats;
+using StudioCore.Application;
+using StudioCore.Editors.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace StudioCore.Editors.ParamEditor;
+
+
+public static class ParamIO
+{
+    private static readonly StringBuilder _reportBuilder = new StringBuilder();
+
+    public static string GenerateCSV(ProjectEntry project, IReadOnlyList<Param.Row> rows, Param param, char separator, bool includeName = true, Dictionary<string, bool> includedFields = null)
+    {
+        _reportBuilder.Clear();
+
+        // Columns
+        if(includeName)
+        {
+            _reportBuilder.Append($@"ID{separator}Name");
+        }
+        else
+        {
+            _reportBuilder.Append($@"ID");
+        }
+
+        var paramdef = param.AppliedParamdef;
+
+        if (paramdef != null)
+        {
+            foreach (PARAMDEF.Field f in paramdef.Fields.FindAll(f => f.IsValidForRegulationVersion(project.Handler.ParamData.PrimaryBank.ParamVersion)))
+            {
+                if (includedFields == null)
+                {
+                    _reportBuilder.Append($@"{separator}{f.InternalName}");
+                }
+                else
+                {
+                    if(includedFields.ContainsKey(f.InternalName))
+                    {
+                        var canInclude = includedFields[f.InternalName];
+
+                        if (canInclude)
+                        {
+                            _reportBuilder.Append($@"{separator}{f.InternalName}");
+                        }
+                    }
+                }
+            }
+        }
+
+        _reportBuilder.Append("\n");
+
+        // Data
+        foreach (Param.Row row in rows)
+        {
+            var name = row.Name == null ? "null" : row.Name.Replace(separator, '-');
+
+            if(includeName)
+            {
+                _reportBuilder.Append($@"{row.ID}{separator}{name}");
+            }
+            else
+            {
+                _reportBuilder.Append($@"{row.ID}");
+            }
+
+            foreach (Param.Column cell in row.Columns)
+            {
+                if (includedFields == null)
+                {
+                    _reportBuilder.Append($@"{separator}{row[cell].Value.ToParamEditorString()}");
+                }
+                else
+                {
+                    if (includedFields.ContainsKey(cell.Def.InternalName))
+                    {
+                        var canInclude = includedFields[cell.Def.InternalName];
+
+                        if (canInclude)
+                        {
+                            _reportBuilder.Append($@"{separator}{row[cell].Value.ToParamEditorString()}");
+                        }
+                    }
+                }
+            }
+
+            _reportBuilder.Append("\n");
+        }
+
+        return _reportBuilder.ToString();
+    }
+
+    public static string GenerateSingleCSV(IReadOnlyList<Param.Row> rows, Param param, string field, char separator)
+    {
+        _reportBuilder.Clear();
+
+        _reportBuilder.Append($@"ID{separator}{field}");
+        _reportBuilder.Append("\n");
+
+        foreach (Param.Row row in rows)
+        {
+            if (field.Equals("Name"))
+            {
+                var name = row.Name == null ? "null" : row.Name.Replace(separator, '-');
+                _reportBuilder.Append($@"{row.ID}{separator}{name}");
+            }
+            else
+            {
+                var fieldValue = ParamUtils.GetFieldExportString(row, field);
+
+                _reportBuilder.Append($@"{row.ID}{separator}{fieldValue}");
+            }
+
+            _reportBuilder.Append("\n");
+        }
+
+        return _reportBuilder.ToString();
+    }
+
+    public static (string, CompoundAction) ApplyCSV(ProjectEntry project, ParamBank bank, string csvString, string param,
+    bool appendOnly, bool mayReplaceRow, char separator)
+    {
+        if (!bank.Params.ContainsKey(param))
+            return (LOC.Get("PARAM_CSV_Invalid_Param_Name"), null);
+
+        Param p = bank.Params[param];
+
+        if (p == null)
+            return (LOC.Get("PARAM_CSV_No_Param_Selected"), null);
+
+        var paramdef = p.AppliedParamdef;
+        if (paramdef == null)
+            return (LOC.Get("PARAM_CSV_Invalid_Data_Type_Parse"), null);
+
+        var csvLines = csvString.Split("\n");
+        if (csvLines.Length == 0)
+            return (LOC.Get("PARAM_CSV_Empty_File"), null);
+
+        // Parse header row to build column index map
+        var headerLine = csvLines[0].Trim();
+        if (!headerLine.StartsWith($"ID{separator}"))
+        {
+            return (LOC.Get("PARAM_CSV_Missing_Header"), null);
+        }
+
+        var headerCols = headerLine.Split(separator);
+
+        var includesName = false;
+        if (headerCols.Length > 1)
+        {
+            var nameCol = headerCols[1];
+            if(nameCol == "Name")
+                includesName = true;
+        }
+
+        // Map from field InternalName -> index in CSV columns
+        var colIndexMap = new Dictionary<string, int>();
+
+        var startIndex = 1;
+        if (includesName)
+            startIndex = 2;
+
+        for (var i = startIndex; i < headerCols.Length; i++)
+        {
+            var colName = headerCols[i].Trim();
+            if (!string.IsNullOrEmpty(colName))
+            {
+                colIndexMap[colName] = i;
+            }
+        }
+
+        var changeCount = 0;
+        var addedCount = 0;
+        List<EditorAction> actions = new();
+        List<Param.Row> addedParams = new();
+
+        foreach (var csvLine in csvLines.Skip(1))
+        {
+            if (csvLine.Trim().Equals(""))
+                continue;
+
+            var csvs = csvLine.Trim().Split(separator);
+            if (csvs.Length < 2)
+                continue;
+
+            var id = int.Parse(csvs[0]);
+
+            var name = "";
+            if (includesName)
+                name = csvs[1];
+
+            Param.Row row = p[id];
+
+            if (!includesName)
+                name = row.Name;
+
+            // If a user only wants to import new rows from the CSV
+            if(CFG.Current.Param_CSV_Ignore_Existing_Rows)
+            {
+                if (row != null)
+                    continue;
+            }
+
+            if (row == null || mayReplaceRow)
+            {
+                row = new Param.Row(id, name, p);
+                addedParams.Add(row);
+            }
+
+            if (!name.Equals(row.Name))
+                actions.Add(new PropertiesChangedAction(row.GetType().GetProperty("Name"), -1, row, name));
+
+            // Match columns by name rather than position
+            foreach (Param.Column col in row.Columns)
+            {
+                var internalName = col.Def.InternalName;
+                if (!colIndexMap.TryGetValue(internalName, out var csvIndex))
+                    continue; // Column not present in CSV, skip it
+
+                if (csvIndex >= csvs.Length)
+                    continue; // Row doesn't have this column's value
+
+                var v = csvs[csvIndex];
+
+                if (col.ValueType.IsArray)
+                {
+                    var newval = ParamUtils.Dummy8Read(v, col.Def.ArrayLength);
+                    if (newval == null)
+                    {
+                        return (LOC.Get("PARAM_CSV_Failed_to_Assign_Value_To_Field", v, internalName), null);
+                    }
+
+                    actions.AppendParamEditAction(row, (ParamEditorPseudoColumn.None, col), newval);
+                }
+                else
+                {
+                    try
+                    {
+                        var newval = Convert.ChangeType(v, row.Get((ParamEditorPseudoColumn.None, col)).GetType());
+                        if (newval == null)
+                        {
+                            return (LOC.Get("PARAM_CSV_Failed_to_Assign_Value_To_Field", v, internalName), null);
+                        }
+
+                        actions.AppendParamEditAction(row, (ParamEditorPseudoColumn.None, col), newval);
+                    }
+                    catch(FormatException)
+                    {
+                        return (LOC.Get("PARAM_CSV_Failed_to_Convert_String_to_Value"), null);
+                    }
+                }
+            }
+        }
+
+        changeCount = actions.Count;
+        addedCount = addedParams.Count;
+        if (addedCount != 0)
+        {
+            actions.Add(new AddParamsAction(project.Handler.ParamEditor, p, "legacystring", addedParams, appendOnly, mayReplaceRow));
+        }
+
+        return (LOC.Get("PARAM_CSV_Result_Effect", changeCount, addedCount), new CompoundAction(actions));
+    }
+
+    public static (string, CompoundAction) ApplySingleCSV(ProjectEntry project, ParamBank bank, string csvString, string param,
+    string field, char separator, bool ignoreMissingRows, bool onlyAffectEmptyNames = false, bool onlyAffectVanillaNames = false, bool skipInvalidLines = false)
+    {
+        var getVanillaRow = onlyAffectVanillaNames;
+        try
+        {
+            Param.Row FindRow(Param p, int id, int idCount, out int iteration)
+            {
+                iteration = 1;
+                for (var i = 0; i < p.Rows.Count; i++)
+                {
+                    if (p.Rows[i].ID == id)
+                    {
+                        if (iteration == idCount)
+                            return p.Rows[i];
+                        else
+                            iteration++;
+                    }
+                }
+                return null;
+            }
+
+            Param p = bank.Params[param];
+            if (p == null)
+                return (LOC.Get("PARAM_CSV_No_Param_Selected"), null);
+
+            Param p_vanilla = null;
+            if (getVanillaRow)
+                p_vanilla = project.Handler.ParamData.VanillaBank.Params[param];
+
+            var csvLines = csvString.Split("\n");
+
+            // Parse header to find which CSV column index holds our target field
+            var fieldColIndex = 1; // default: assume second column
+            if (csvLines.Length > 0 && csvLines[0].Trim().StartsWith($"ID{separator}"))
+            {
+                var headerCols = csvLines[0].Trim().Split(separator);
+                var foundIndex = Array.FindIndex(headerCols, h => h.Trim().Equals(field, StringComparison.Ordinal));
+                if (foundIndex < 0)
+                    return (LOC.Get("PARAM_CSV_Wrong_Field_Name"), null);
+                fieldColIndex = foundIndex;
+                csvLines[0] = ""; // skip header
+            }
+
+            Dictionary<int, int> idCounts = new();
+            var changeCount = 0;
+            List<EditorAction> actions = new();
+
+            foreach (var csvLine in csvLines)
+            {
+                if (csvLine.Trim().Equals(""))
+                    continue;
+
+                var csvs = csvLine.Trim().Split(separator);
+
+                if (skipInvalidLines && csvs.Length < fieldColIndex + 1)
+                    continue;
+
+                if (csvs.Length < fieldColIndex + 1)
+                    return (LOC.Get("PARAM_CSV_Wrong_Value_Count"), null);
+
+                var id = int.Parse(csvs[0]);
+
+                idCounts.TryAdd(id, 0);
+                var idCount = idCounts[id] = idCounts[id] + 1;
+
+                var value = csvs[fieldColIndex];
+
+                Param.Row row = FindRow(p, id, idCount, out var idIteration);
+                Param.Row row_vanilla = null;
+                if (getVanillaRow && p_vanilla != null)
+                    row_vanilla = FindRow(p_vanilla, id, idCount, out _);
+
+                if (row == null)
+                {
+                    if (ignoreMissingRows)
+                        continue;
+                    return idIteration <= 1
+                        ? (LOC.Get("PARAM_CSV_Failed_to_Locate_Row", id), null)
+                        : (LOC.Get("PARAM_CSV_Failed_to_Locate_Row_Iteration", id, idIteration), null);
+                }
+
+                if (field.Equals("Name"))
+                {
+                    if (value.Equals(row.Name))
+                        continue;
+
+                    if (onlyAffectVanillaNames)
+                    {
+                        if (row_vanilla != null && row.Name == row_vanilla.Name)
+                            actions.Add(new PropertiesChangedAction(row.GetType().GetProperty("Name"), -1, row, value));
+                    }
+                    else if (!onlyAffectEmptyNames || string.IsNullOrEmpty(row.Name))
+                    {
+                        actions.Add(new PropertiesChangedAction(row.GetType().GetProperty("Name"), -1, row, value));
+                    }
+                }
+                else
+                {
+                    Param.Column col = p[field];
+                    if (col == null)
+                        return (LOC.Get("PARAM_CSV_Failed_to_Locate_Field", field), null);
+
+                    try
+                    {
+                        if (col.ValueType.IsArray)
+                        {
+                            var newval = ParamUtils.Dummy8Read(value, col.Def.ArrayLength);
+
+                            if (newval == null)
+                            {
+                                return (LOC.Get("PARAM_CSV_Failed_to_Assign_Value_To_Field", value, col.Def.InternalName), null);
+                            }
+
+                            actions.AppendParamEditAction(row, (ParamEditorPseudoColumn.None, col), newval);
+                        }
+                        else
+                        {
+                            var newval = Convert.ChangeType(value, row.Get((ParamEditorPseudoColumn.None, col)).GetType());
+                            if (newval == null)
+                            {
+                                return (LOC.Get("PARAM_CSV_Failed_to_Assign_Value_To_Field", value, col.Def.InternalName), null);
+                            }
+
+                            actions.AppendParamEditAction(row, (ParamEditorPseudoColumn.None, col), newval);
+                        }
+                    }
+                    catch (FormatException)
+                    {
+                        return (LOC.Get("PARAM_CSV_Failed_to_Convert_String_to_Value"), null);
+                    }
+                }
+            }
+
+            changeCount = actions.Count;
+            return (LOC.Get("PARAM_CSV_Row_Result_Effect", changeCount), new CompoundAction(actions));
+        }
+        catch
+        {
+            return (LOC.Get("PARAM_CSV_Invalid_Data_Type_Parse"), null);
+        }
+    }
+}

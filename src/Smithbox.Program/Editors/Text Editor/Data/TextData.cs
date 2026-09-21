@@ -1,0 +1,213 @@
+﻿using StudioCore.Application;
+using StudioCore.Utilities;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading.Tasks;
+
+namespace StudioCore.Editors.TextEditor;
+
+public class TextData : IDisposable
+{
+    public ProjectEntry Project;
+
+    public TextBank PrimaryBank;
+    public TextBank VanillaBank;
+    public Dictionary<string, TextBank> AuxBanks = new();
+
+    public FileDictionary FmgFiles = new();
+
+    public FmgDescriptors FmgDescriptors = new();
+
+    public IncrementalTemplates Templates = new();
+
+    public TextData(ProjectEntry project)
+    {
+        Project = project;
+    }
+
+    public async Task<bool> Setup()
+    {
+        await Task.Yield();
+
+        PrimaryBank = new("Primary", Project, Project.VFS.FS);
+        VanillaBank = new("Vanilla", Project, Project.VFS.VanillaFS);
+
+        // FMG Descriptors
+        Task<bool> descriptorTask = SetupFmgDescriptors();
+        bool descriptorTaskResult = await descriptorTask;
+
+        if (!descriptorTaskResult)
+        {
+            Smithbox.LogError(this, LOC.Get("TEXT_Data_FMG_Descriptor_Setup_PASS"));
+        }
+        else
+        {
+            Smithbox.Log(this, LOC.Get("TEXT_Data_FMG_Descriptor_Setup_FAIL"));
+        }
+
+        // Templates
+        Task<bool> templatesTask = SetupIncrementalTemplates();
+        bool templatesTaskResult = await templatesTask;
+
+        if (!templatesTaskResult)
+        {
+            Smithbox.LogError(this, LOC.Get("TEXT_Data_Incremental_Templates_Setup_FAIL"));
+        }
+        else
+        {
+            Smithbox.Log(this, LOC.Get("TEXT_Data_Incremental_Templates_Setup_PASS"));
+        }
+
+        // Primary Bank
+        Task<bool> primaryBankTask = PrimaryBank.Setup();
+        bool primaryBankTaskResult = await primaryBankTask;
+
+        if (!primaryBankTaskResult)
+        {
+            Smithbox.LogError(this, LOC.Get("TEXT_Data_Primary_Bank_Setup_FAIL"));
+        }
+        else
+        {
+            Smithbox.Log(this, LOC.Get("TEXT_Data_Primary_Bank_Setup_PASS"));
+        }
+
+        // Vanilla Bank
+        Task<bool> vanillaBankTask = VanillaBank.Setup();
+        bool vanillaBankTaskResult = await vanillaBankTask;
+
+        if (!vanillaBankTaskResult)
+        {
+            Smithbox.LogError(this, LOC.Get("TEXT_Data_Vanilla_Bank_Setup_FAIL"));
+        }
+        else
+        {
+            Smithbox.Log(this, LOC.Get("TEXT_Data_Vanilla_Bank_Setup_PASS"));
+        }
+
+        return true;
+    }
+
+    public async Task<bool> LoadAuxBank(ProjectEntry targetProject, bool reloadProject)
+    {
+        await Smithbox.Orchestrator.LoadAuxiliaryProject(targetProject, ProjectInitType.TextEditorOnly, reloadProject);
+
+        var newAuxBank = new TextBank($"{targetProject.Descriptor.ProjectName}",Project, targetProject.VFS.FS);
+
+        // Aux Bank
+        Task<bool> auxBankTask = newAuxBank.Setup();
+        bool auxBankTaskResult = await auxBankTask;
+
+        if (!auxBankTaskResult)
+        {
+            Smithbox.LogError(this, LOC.Get("TEXT_Data_Vanilla_Bank_Setup_FAIL", targetProject.Descriptor.ProjectName));
+        }
+
+        if (AuxBanks.ContainsKey(targetProject.Descriptor.ProjectName))
+        {
+            AuxBanks[targetProject.Descriptor.ProjectName] = newAuxBank;
+        }
+        else
+        {
+            AuxBanks.Add(targetProject.Descriptor.ProjectName, newAuxBank);
+        }
+
+        Smithbox.Log(this, LOC.Get("TEXT_Data_Aux_Bank_Setup_PASS", targetProject.Descriptor.ProjectName));
+
+        return true;
+    }
+
+    #region Incremental Templates
+    public async Task<bool> SetupIncrementalTemplates()
+    {
+        await Task.Yield();
+
+        Templates = new();
+
+        var folder = @$"{AppContext.BaseDirectory}/Assets/FMG/Templates";
+
+        foreach(var file in Directory.EnumerateFiles(folder))
+        {
+            try
+            {
+                var newTemplate = new IncrementalTemplateEntry();
+                var filestring = await File.ReadAllTextAsync(file);
+
+                try
+                {
+                    newTemplate = JsonSerializer.Deserialize(filestring, TextEditorJsonSerializerContext.Default.IncrementalTemplateEntry);
+
+                    Templates.Add(newTemplate);
+                }
+                catch (Exception e)
+                {
+                    Smithbox.LogError(this, LOC.Get("TEXT_Data_Deserialize_Incremental_Template_FAIL", file), e);
+                }
+            }
+            catch (Exception e)
+            {
+                Smithbox.LogError(this, LOC.Get("TEXT_Data_Read_Incremental_Template_FAIL", file), e);
+            }
+        }
+
+        return true;
+    }
+    #endregion
+
+    #region FMG Descriptors
+
+    public async Task<bool> SetupFmgDescriptors()
+    {
+        var jsonName = "FMG Descriptor Registry.json";
+
+        await Task.Yield();
+
+        var folder = @$"{AppContext.BaseDirectory}/Assets/FMG/{ProjectUtils.GetGameDirectory(Project)}";
+        var file = Path.Combine(folder, jsonName);
+
+        if (File.Exists(file))
+        {
+            try
+            {
+                var filestring = await File.ReadAllTextAsync(file);
+
+                try
+                {
+                    FmgDescriptors = JsonSerializer.Deserialize(filestring, TextEditorJsonSerializerContext.Default.FmgDescriptors);
+                }
+                catch (Exception e)
+                {
+                    Smithbox.LogError(this, LOC.Get("TEXT_Data_Deserialize_FMG_Descriptors_FAIL", file), e);
+                }
+            }
+            catch (Exception e)
+            {
+                Smithbox.LogError(this, LOC.Get("TEXT_Data_Read_FMG_Descriptors_FAIL", file), e);
+            }
+        }
+
+        return true;
+    }
+    #endregion
+
+    #region Dispose
+    public void Dispose()
+    {
+        PrimaryBank?.Dispose();
+        VanillaBank?.Dispose();
+
+        foreach(var entry in AuxBanks)
+        {
+            entry.Value?.Dispose();
+        }
+
+        PrimaryBank = null;
+        VanillaBank = null;
+        AuxBanks = null;
+
+        FmgFiles = null;
+    }
+    #endregion
+}

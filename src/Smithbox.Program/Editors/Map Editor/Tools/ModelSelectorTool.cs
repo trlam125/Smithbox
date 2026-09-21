@@ -1,0 +1,761 @@
+﻿using Hexa.NET.ImGui;
+using SoulsFormats;
+using StudioCore.Application;
+using StudioCore.Editors.Common;
+using StudioCore.Editors.MetadataEditor;
+using StudioCore.Keybinds;
+using StudioCore.Utilities;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Numerics;
+
+namespace StudioCore.Editors.MapEditor;
+public class ModelSelectorTool
+{
+    public MapEditorView View;
+    public ProjectEntry Project;
+
+    private string _selectedEntry = "";
+
+    private bool SelectNextEntry = false;
+
+    public string ModelFilter = "";
+    public bool ExactModelFilter = false;
+
+    public ModelSelectorTool(MapEditorView view, ProjectEntry project)
+    {
+        View = view;
+        Project = project;
+    }
+
+    /// <summary>
+    /// Tool Window
+    /// </summary>
+    public void OnToolWindow()
+    {
+        ImGui.BeginChild("ModelSelectorToolSection", ImGuiChildFlags.Borders);
+
+        GUI.WrappedText("Use this to switch a selected map object to a different model.");
+
+        GUI.Spacer();
+        GUI.SimpleHeader("Options", "");
+
+        ImGui.Checkbox("Update Name on Switch", ref CFG.Current.MapEditor_Model_Selector_Update_Name);
+        GUI.Tooltip("When a map object is switched to a new form, update the name to match the new form.");
+
+        if (View.Project.Descriptor.ProjectType is ProjectType.ER or ProjectType.AC6)
+        {
+            ImGui.Checkbox("Update Instance ID on Switch", ref CFG.Current.MapEditor_Model_Selector_Update_Instance_ID);
+            GUI.Tooltip("When a map object is switched to a new form, update the Instance ID to account for the new form.");
+        }
+
+        // TOOD
+        //ImGui.Checkbox("Update Params on Switch", ref CFG.Current.MapEditor_Model_Selector_Update_NpcParams);
+        //UIHelper.Tooltip("When a map object is switched to a new form, update the NpcParam and NpcThinkParam to the closest suitable rows (based on the character ID).");
+
+        GUI.Spacer();
+        GUI.SimpleHeader("List", "");
+
+        EditorFilters.DisplayFramedListFilter("modelSelector", ref ModelFilter, ref ExactModelFilter);
+
+        var curSelection = View.ViewportSelection.GetSelection();
+
+        if (curSelection.Count > 0)
+        {
+            var firstSelection = (Entity)curSelection.First();
+
+            if (EntityHelper.IsPartEnemy(firstSelection) || EntityHelper.IsPartDummyEnemy(firstSelection))
+            {
+                DisplayCharacterList();
+            }
+            else if (EntityHelper.IsPartAsset(firstSelection) || EntityHelper.IsPartDummyAsset(firstSelection))
+            {
+                DisplayAssetList();
+            }
+            else if (EntityHelper.IsPartMapPiece(firstSelection))
+            {
+                DisplayMapPieceList();
+            }
+            else if (EntityHelper.IsPartCollision(firstSelection))
+            {
+                if (Project.Descriptor.ProjectType is ProjectType.ER or ProjectType.AC6 or ProjectType.NR)
+                {
+                    DisplayCollisionList();
+                }
+            }
+            else
+            {
+                ImGui.Text("Your current selection does not use a model.");
+            }
+        }
+        else
+        {
+            ImGui.Text("You must select a valid map object first.");
+        }
+
+        ImGui.EndChild();
+    }
+
+    private void DisplayCharacterList()
+    {
+        // TODO: this needs to draw from a scanned list of characters, not the alias list
+        if (View.Project.Handler.ProjectData.Aliases.TryGetValue(ProjectAliasType.Characters, out List<AliasEntry> characterAliases))
+        {
+            ImGui.BeginChild("##characterSelectorList", new Vector2(0, 0), ImGuiChildFlags.Borders);
+
+            foreach (var entry in characterAliases)
+            {
+                if (FilterSelectionList(entry))
+                {
+                    if (ImGui.Selectable(entry.ID, entry.ID == _selectedEntry, ImGuiSelectableFlags.AllowDoubleClick))
+                    {
+                        _selectedEntry = entry.ID;
+
+                        if (ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+                        {
+                            ApplyMapAssetSelection(_selectedEntry, FileSelectionType.Character);
+                        }
+                    }
+
+                    // Arrow Selection
+                    if (ImGui.IsItemHovered() && SelectNextEntry)
+                    {
+                        SelectNextEntry = false;
+                        _selectedEntry = entry.ID;
+                        ApplyMapAssetSelection(_selectedEntry, FileSelectionType.Character);
+                    }
+
+                    if (ImGui.IsItemFocused())
+                    {
+                        if(InputManager.HasArrowSelection())
+                        {
+                            SelectNextEntry = true;
+                        }
+                    }
+
+                    DisplaySelectableAlias(entry);
+                }
+            }
+
+            ImGui.EndChild();
+        }
+    }
+
+    private void DisplayAssetList()
+    {
+        // TODO: this needs to draw from a scanned list of assets, not the alias list
+        if (View.Project.Handler.ProjectData.Aliases.TryGetValue(ProjectAliasType.Assets, out List<AliasEntry> assetAliases))
+        {
+            ImGui.BeginChild("##assetSelectorList", new Vector2(0, 0), ImGuiChildFlags.Borders);
+
+            foreach (var entry in assetAliases)
+            {
+                if (FilterSelectionList(entry))
+                {
+                    if (ImGui.Selectable(entry.ID, entry.ID == _selectedEntry, ImGuiSelectableFlags.AllowDoubleClick))
+                    {
+                        _selectedEntry = entry.ID;
+
+                        if (ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+                        {
+                            ApplyMapAssetSelection(_selectedEntry, FileSelectionType.Asset);
+                        }
+                    }
+
+                    // Arrow Selection
+                    if (ImGui.IsItemHovered() && SelectNextEntry)
+                    {
+                        SelectNextEntry = false;
+                        _selectedEntry = entry.ID;
+                        ApplyMapAssetSelection(_selectedEntry, FileSelectionType.Asset);
+                    }
+
+                    if (ImGui.IsItemFocused())
+                    {
+                        if (InputManager.HasArrowSelection())
+                        {
+                            SelectNextEntry = true;
+                        }
+                    }
+
+                    DisplaySelectableAlias(entry);
+                }
+            }
+
+            ImGui.EndChild();
+        }
+    }
+
+    private void DisplayMapPieceList()
+    {
+        var maps = MsbUtils.GetFullMapList(View.Project);
+
+        // TODO: this needs to draw from a scanned list of map pieces, not the alias list
+        if (View.Project.Handler.ProjectData.Aliases.TryGetValue(ProjectAliasType.MapPieces, out List<AliasEntry> mapPieceAliases))
+        {
+            ImGui.BeginChild("##mapPieceSelectorList", new Vector2(0, 0), ImGuiChildFlags.Borders);
+
+            foreach (var map in maps)
+            {
+                var displayedMapName = $"{map} - {AliasHelper.GetMapNameAlias(View.Project, map)}";
+
+                GUI.SimpleHeader($"{map}_header", $"{displayedMapName}", "", UI.Current.ImGui_Default_Text_Color);
+
+                var displayedName = $"{map}";
+                var modelName = map.Replace($"{map}_", "m");
+                displayedName = $"{modelName}";
+
+                if (View.Project.Descriptor.ProjectType == ProjectType.DS1 || View.Project.Descriptor.ProjectType == ProjectType.DS1R)
+                {
+                    displayedName = displayedName.Replace($"A{map.Substring(1, 2)}", "");
+                }
+
+                foreach (var entry in mapPieceAliases)
+                {
+                    var mapPieceName = $"{entry.ID.Replace(map, "m")}";
+
+                    if (ImGui.Selectable(mapPieceName, entry.ID == _selectedEntry, ImGuiSelectableFlags.AllowDoubleClick))
+                    {
+                        _selectedEntry = entry.ID;
+
+                        if (ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+                        {
+                            ApplyMapAssetSelection(_selectedEntry, FileSelectionType.MapPiece, map);
+                        }
+                    }
+
+                    // Arrow Selection
+                    if (ImGui.IsItemHovered() && SelectNextEntry)
+                    {
+                        SelectNextEntry = false;
+                        _selectedEntry = entry.ID;
+                        ApplyMapAssetSelection(_selectedEntry, FileSelectionType.MapPiece, map);
+                    }
+
+                    if (ImGui.IsItemFocused())
+                    {
+                        if (InputManager.HasArrowSelection())
+                        {
+                            SelectNextEntry = true;
+                        }
+                    }
+
+                    DisplaySelectableAlias(entry);
+                }
+            }
+
+            ImGui.EndChild();
+        }
+    }
+    private void DisplayCollisionList()
+    {
+        var mapID = View.Selection.SelectedMapID;
+        var collisionList = View.HavokCollisionBank.MapCollisions.GetValueOrDefault(mapID);
+
+        if (collisionList == null)
+            return;
+
+        GUI.SimpleHeader($"{mapID}_header", $"{mapID}", "", UI.Current.ImGui_Default_Text_Color);
+
+        ImGui.BeginChild("##collisionSelectorList", new Vector2(0, 0), ImGuiChildFlags.Borders);
+
+        foreach (var col in collisionList)
+        {
+            var shortName = col.Replace(".hkx.dcx", "");
+            shortName = shortName.Replace($"h{mapID.Replace("m", "")}_", "h");
+
+            if (!col.StartsWith("h"))
+                continue;
+
+            var displayedName = $"{shortName}";
+
+            if (ImGui.Selectable(displayedName, col == _selectedEntry, ImGuiSelectableFlags.AllowDoubleClick))
+            {
+                _selectedEntry = col;
+
+                if (ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+                {
+                    ApplyMapAssetSelection(shortName, FileSelectionType.Collision);
+                }
+            }
+
+            // Arrow Selection
+            if (ImGui.IsItemHovered() && SelectNextEntry)
+            {
+                SelectNextEntry = false;
+                _selectedEntry = col;
+                ApplyMapAssetSelection(shortName, FileSelectionType.Collision);
+            }
+
+            if (ImGui.IsItemFocused())
+            {
+                if (InputManager.HasArrowSelection())
+                {
+                    SelectNextEntry = true;
+                }
+            }
+        }
+
+        ImGui.EndChild();
+    }
+    private bool FilterSelectionList(AliasEntry entry)
+    {
+        var lowerName = entry.ID.ToLower();
+
+        var refName = entry.Name;
+        var refTagList = entry.Tags;
+
+        if (!CFG.Current.MapEditor_Model_Selector_Display_Low_Detail_Entries)
+        {
+            if (entry.ID.Substring(entry.ID.Length - 2) == "_l")
+            {
+                return false;
+            }
+        }
+
+        var isMatch = EditorFilters.IsMatch(ModelFilter, entry.Name, ExactModelFilter);
+
+        if (isMatch)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private void DisplaySelectableAlias(AliasEntry entry)
+    {
+        var lowerName = entry.ID.ToLower();
+
+        if (CFG.Current.MapEditor_Model_Selector_Display_Aliases)
+        {
+            GUI.DisplayAlias(entry.Name);
+        }
+
+        // Tags
+        if (CFG.Current.MapEditor_Model_Selector_Display_Tags)
+        {
+            var tagString = string.Join(" ", entry.Tags);
+            AliasHelper.DisplayTagAlias(tagString);
+        }
+    }
+
+    private void ApplyMapAssetSelection(string _selectedName, FileSelectionType type, string mapId = "")
+    {
+        var modelName = _selectedName;
+
+        if (modelName.Contains("aeg"))
+        {
+            modelName = modelName.Replace("aeg", "AEG");
+        }
+
+        if (type == FileSelectionType.MapPiece)
+        {
+            SetObjectModelForSelection(modelName, type, mapId);
+        }
+        else
+        {
+            SetObjectModelForSelection(modelName, type, "");
+        }
+    }
+
+    private void SetObjectModelForSelection(string modelName, FileSelectionType assetType, string assetMapId)
+    {
+        var actlist = new List<ViewportAction>();
+
+        var selected = View.ViewportSelection.GetFilteredSelection<Entity>();
+
+        foreach (var s in selected)
+        {
+            var isValidObjectType = false;
+
+            if (assetType == FileSelectionType.Character)
+            {
+                switch (View.Project.Descriptor.ProjectType)
+                {
+                    case ProjectType.DES:
+                        if (s.WrappedObject is MSBD.Part.Enemy)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.DS1:
+                    case ProjectType.DS1R:
+                        if (s.WrappedObject is MSB1.Part.Enemy)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.DS2:
+                    case ProjectType.DS2S:
+                        break;
+                    case ProjectType.DS3:
+                        if (s.WrappedObject is MSB3.Part.Enemy)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.BB:
+                        if (s.WrappedObject is MSBB.Part.Enemy)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.SDT:
+                        if (s.WrappedObject is MSBS.Part.Enemy)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.ER:
+                        if (s.WrappedObject is MSBE.Part.Enemy)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.AC6:
+                        if (s.WrappedObject is MSB_AC6.Part.Enemy)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.NR:
+                        if (s.WrappedObject is MSB_NR.Part.Enemy)
+                            isValidObjectType = true;
+                        break;
+                    default:
+                        throw new ArgumentException("Selected entity type must be Enemy");
+                }
+            }
+            if (assetType == FileSelectionType.Asset)
+            {
+                switch (View.Project.Descriptor.ProjectType)
+                {
+                    case ProjectType.DES:
+                        if (s.WrappedObject is MSBD.Part.Object)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.DS1:
+                    case ProjectType.DS1R:
+                        if (s.WrappedObject is MSB1.Part.Object)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.DS2:
+                    case ProjectType.DS2S:
+                        if (s.WrappedObject is MSB2.Part.Object)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.DS3:
+                        if (s.WrappedObject is MSB3.Part.Object)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.BB:
+                        if (s.WrappedObject is MSBB.Part.Object)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.SDT:
+                        if (s.WrappedObject is MSBS.Part.Object)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.ER:
+                        if (s.WrappedObject is MSBE.Part.Asset)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.AC6:
+                        if (s.WrappedObject is MSB_AC6.Part.Asset)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.NR:
+                        if (s.WrappedObject is MSB_NR.Part.Asset)
+                            isValidObjectType = true;
+                        break;
+                    default:
+                        throw new ArgumentException("Selected entity type must be Object/Asset");
+                }
+            }
+
+            if (assetType == FileSelectionType.Collision)
+            {
+                switch (View.Project.Descriptor.ProjectType)
+                {
+                    case ProjectType.DES:
+                        if (s.WrappedObject is MSBD.Part.Collision)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.DS1:
+                    case ProjectType.DS1R:
+                        if (s.WrappedObject is MSB1.Part.Collision)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.DS2:
+                    case ProjectType.DS2S:
+                        if (s.WrappedObject is MSB2.Part.Collision)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.DS3:
+                        if (s.WrappedObject is MSB3.Part.Collision)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.BB:
+                        if (s.WrappedObject is MSBB.Part.Collision)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.SDT:
+                        if (s.WrappedObject is MSBS.Part.Collision)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.ER:
+                        if (s.WrappedObject is MSBE.Part.Collision)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.AC6:
+                        if (s.WrappedObject is MSB_AC6.Part.Collision)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.NR:
+                        if (s.WrappedObject is MSB_NR.Part.Collision)
+                            isValidObjectType = true;
+                        break;
+                    default:
+                        throw new ArgumentException("Selected entity type must be Object/Asset");
+                }
+            }
+
+            if (assetType == FileSelectionType.MapPiece)
+            {
+                switch (View.Project.Descriptor.ProjectType)
+                {
+                    case ProjectType.DES:
+                        if (s.WrappedObject is MSBD.Part.MapPiece)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.DS1:
+                    case ProjectType.DS1R:
+                        if (s.WrappedObject is MSB1.Part.MapPiece)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.DS2:
+                    case ProjectType.DS2S:
+                        if (s.WrappedObject is MSB2.Part.MapPiece)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.DS3:
+                        if (s.WrappedObject is MSB3.Part.MapPiece)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.BB:
+                        if (s.WrappedObject is MSBB.Part.MapPiece)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.SDT:
+                        if (s.WrappedObject is MSBS.Part.MapPiece)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.ER:
+                        if (s.WrappedObject is MSBE.Part.MapPiece)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.AC6:
+                        if (s.WrappedObject is MSB_AC6.Part.MapPiece)
+                            isValidObjectType = true;
+                        break;
+                    case ProjectType.NR:
+                        if (s.WrappedObject is MSB_NR.Part.MapPiece)
+                            isValidObjectType = true;
+                        break;
+                    default:
+                        throw new ArgumentException("Selected entity type must be MapPiece");
+                }
+            }
+
+            if (assetType == FileSelectionType.MapPiece)
+            {
+                if (s.Parent != null)
+                {
+                    var mapName = s.Parent.Name;
+                    if (mapName != assetMapId)
+                    {
+                        PlatformUtils.Instance.MessageBox($"Map Pieces are specific to each map.\nYou cannot change a Map Piece in {mapName} to a Map Piece from {assetMapId}.", "Object Browser", MessageBoxButtons.OK);
+
+                        isValidObjectType = false;
+                    }
+                }
+                else
+                {
+                    isValidObjectType = false;
+                }
+            }
+
+            if (isValidObjectType)
+            {
+                if (assetType == FileSelectionType.MapPiece)
+                {
+                    // Adjust modelName for mappieces, since by default they are mXX_YY_ZZ_AA_<id>
+                    string newName = modelName.Replace($"{assetMapId}_", "m");
+                    modelName = newName;
+                }
+
+                // ModelName
+                var action = s.ChangeObjectProperty("ModelName", modelName);
+                actlist.Add(action);
+
+
+                if (CFG.Current.MapEditor_Model_Selector_Update_Name)
+                {
+                    var updateNameAction = UpdateEntityName(modelName, s);
+                    actlist.Add(updateNameAction);
+                }
+
+                if (CFG.Current.MapEditor_Model_Selector_Update_Instance_ID)
+                {
+                    if (s.WrappedObject is MSBE.Part || s.WrappedObject is MSB_AC6.Part)
+                    {
+                        var updateInstanceAction = UpdateInstanceID(modelName, (MsbEntity)s);
+                        actlist.Add(updateInstanceAction);
+                    }
+                }
+            }
+        }
+
+        if (actlist.Any())
+        {
+            var action = new ViewportCompoundAction(actlist);
+
+            View.ViewportActionManager.ExecuteAction(action);
+        }
+    }
+
+    private ViewportAction UpdateEntityName(string modelName, Entity ent)
+    {
+        var name = GetUniqueNameString(modelName);
+        ent.Name = name;
+
+        return ent.GetPropertyChangeAction(ent, "Name", name);
+    }
+
+    private ViewportAction UpdateInstanceID(string modelName, MsbEntity ent)
+    {
+        MapContainer m;
+        m = View.Selection.GetMapContainerFromMapID(ent.MapID);
+
+        Dictionary<MapContainer, HashSet<MsbEntity>> mapPartEntities = new();
+
+        // ER
+        if (ent.WrappedObject is MSBE.Part msbePart)
+        {
+            if (mapPartEntities.TryAdd(m, new HashSet<MsbEntity>()))
+            {
+                foreach (Entity tEnt in m.Objects)
+                {
+                    if (tEnt.WrappedObject != null && tEnt.WrappedObject is MSBE.Part)
+                    {
+                        mapPartEntities[m].Add((MsbEntity)tEnt);
+                    }
+                }
+            }
+
+            var newInstanceID = 9000; // Default start value
+
+            while (mapPartEntities[m].FirstOrDefault(e =>
+                       ((MSBE.Part)e.WrappedObject).ModelName == msbePart.ModelName
+                       && ((MSBE.Part)e.WrappedObject).InstanceID == newInstanceID
+                       && msbePart != (MSBE.Part)e.WrappedObject) != null)
+            {
+                newInstanceID++;
+            }
+
+            return ent.GetPropertyChangeAction(ent, "InstanceID", newInstanceID);
+        }
+
+        // AC6
+        if (ent.WrappedObject is MSB_AC6.Part msb_ac6Part)
+        {
+            if (mapPartEntities.TryAdd(m, new HashSet<MsbEntity>()))
+            {
+                foreach (Entity tEnt in m.Objects)
+                {
+                    if (tEnt.WrappedObject != null && tEnt.WrappedObject is MSB_AC6.Part)
+                    {
+                        mapPartEntities[m].Add((MsbEntity)tEnt);
+                    }
+                }
+            }
+
+            var newInstanceID = 0; // Default start value
+
+            while (mapPartEntities[m].FirstOrDefault(e =>
+                       ((MSB_AC6.Part)e.WrappedObject).ModelName == msb_ac6Part.ModelName
+                       && ((MSB_AC6.Part)e.WrappedObject).TypeIndex == newInstanceID
+                       && msb_ac6Part != (MSB_AC6.Part)e.WrappedObject) != null)
+            {
+                newInstanceID++;
+            }
+
+            return ent.GetPropertyChangeAction(ent, "TypeIndex", newInstanceID);
+        }
+
+        return null;
+    }
+
+    public string GetUniqueNameString(string modelName)
+    {
+        var postfix = 0;
+        var baseName = $"{modelName}_0000";
+
+        var names = new List<string>();
+
+        // Collect names
+        foreach (var entry in View.Project.Handler.MapData.PrimaryBank.Maps)
+        {
+            if (entry.Value.MapContainer == null)
+            {
+                continue;
+            }
+
+            foreach (var ob in entry.Value.MapContainer.Objects)
+            {
+                if (ob is MsbEntity e)
+                {
+                    names.Add(ob.Name);
+                }
+            }
+        }
+
+        var validName = false;
+        while (!validName)
+        {
+            var matchesName = false;
+
+            foreach (var name in names)
+            {
+                // Name already exists
+                if (name == baseName)
+                {
+                    // Increment postfix number by 1
+                    var old_value = postfix;
+                    postfix = postfix + 1;
+
+                    // Replace baseName postfix number
+                    baseName = baseName.Replace($"{PadNameString(old_value)}", $"{PadNameString(postfix)}");
+
+                    matchesName = true;
+                }
+            }
+
+            // If it does not match any name during 1 full iteration, then it must be valid
+            if (!matchesName)
+            {
+                validName = true;
+            }
+        }
+
+        return baseName;
+    }
+
+    private string PadNameString(int value)
+    {
+        if (value < 10)
+        {
+            return $"000{value}";
+        }
+
+        if (value >= 10 && value < 100)
+        {
+            return $"00{value}";
+        }
+
+        if (value >= 100 && value < 1000)
+        {
+            return $"0{value}";
+        }
+
+        return $"{value}";
+    }
+}

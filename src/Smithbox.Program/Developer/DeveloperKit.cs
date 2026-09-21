@@ -1,0 +1,906 @@
+﻿using DotNext;
+using Hexa.NET.ImGui;
+using HKLib.hk2018;
+using HKLib.Serialization.hk2018.Binary;
+using Microsoft.AspNetCore.Mvc.ViewEngines;
+using Octokit;
+using SoulsFormats;
+using StudioCore.Editors.HavokEditor;
+using StudioCore.Editors.MapEditor;
+using StudioCore.Utilities;
+using System.Numerics;
+using System.Text;
+using System.Text.Json;
+
+namespace StudioCore.Developer;
+
+public class DeveloperKit
+{
+    public ProjectType TargetProject = ProjectType.Undefined;
+    public Dictionary<ProjectType, DataProjectEntry> Projects = new();
+    public bool GeneratedProjects = false;
+
+    public DeveloperKit() { }
+
+    public unsafe void Display(float dt, uint mainDockspaceID)
+    {
+        if (Smithbox.Instance._context.Device == null)
+        {
+            ImGui.PushStyleColor(ImGuiCol.WindowBg, *ImGui.GetStyleColorVec4(ImGuiCol.WindowBg));
+        }
+        else
+        {
+            ImGui.PushStyleColor(ImGuiCol.WindowBg, new Vector4(0.0f, 0.0f, 0.0f, 0.0f));
+        }
+
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new Vector2(0.0f, 0.0f));
+
+        ImGui.SetNextWindowDockID(mainDockspaceID, ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowClass(ref GUI.DockGroup_EditorView);
+
+        if (ImGui.Begin($"{LOC.Get("DEV_KIT_Window_Name")}###DeveloperKit", GUI.GetInnerWindowFlags()))
+        {
+            ImGui.PopStyleColor(1);
+            ImGui.PopStyleVar(1);
+
+            ImGui.BeginChild("kitSection", ImGuiChildFlags.Borders);
+
+            DisplayDataSources();
+            DisplayKitTools();
+
+            ImGui.EndChild();
+
+            ImGui.End();
+        }
+        else
+        {
+            ImGui.PopStyleColor(1);
+            ImGui.PopStyleVar(1);
+            ImGui.End();
+        }
+    }
+
+    public void DisplayDataSources()
+    {
+        GUI.ConditionalHeader(
+            LOC.Get("DEV_KIT_Data_Sources_Header"),
+            LOC.Get("DEV_KIT_Data_Sources_Header_TT"), ref CFG.Current.DEVKIT_DisplayDataSources);
+
+        if (CFG.Current.DEVKIT_DisplayDataSources)
+        {
+            var tblFlags = ImGuiTableFlags.SizingFixedFit | ImGuiTableFlags.Borders;
+
+            if (ImGui.BeginTable($"dataSourceTable", 3, tblFlags))
+            {
+                ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthFixed);
+                ImGui.TableSetupColumn("SelectButton", ImGuiTableColumnFlags.WidthFixed);
+                ImGui.TableSetupColumn("InputText", ImGuiTableColumnFlags.WidthStretch);
+
+                DisplayEntry(LOC.Get("DEV_KIT_Col_Data_Folder"), ref CFG.Current.DEVKIT_DataPath_DataFolder);
+                DisplayEntry(LOC.Get("DEV_KIT_Col_Output_Folder"), ref CFG.Current.DEVKIT_DataPath_OutputFolder);
+                DisplayEntry(LOC.Get("DEV_KIT_Col_DES"), ref CFG.Current.DEVKIT_DataPath_DES);
+                DisplayEntry(LOC.Get("DEV_KIT_Col_DS1"), ref CFG.Current.DEVKIT_DataPath_DS1);
+                DisplayEntry(LOC.Get("DEV_KIT_Col_DS1R"), ref CFG.Current.DEVKIT_DataPath_DS1R);
+                DisplayEntry(LOC.Get("DEV_KIT_Col_DS2"), ref CFG.Current.DEVKIT_DataPath_DS2);
+                DisplayEntry(LOC.Get("DEV_KIT_Col_DS2S"), ref CFG.Current.DEVKIT_DataPath_DS2S);
+                DisplayEntry(LOC.Get("DEV_KIT_Col_DS3"), ref CFG.Current.DEVKIT_DataPath_DS3);
+                DisplayEntry(LOC.Get("DEV_KIT_Col_BB"), ref CFG.Current.DEVKIT_DataPath_BB);
+                DisplayEntry(LOC.Get("DEV_KIT_Col_SDT"), ref CFG.Current.DEVKIT_DataPath_SDT);
+                DisplayEntry(LOC.Get("DEV_KIT_Col_ER"), ref CFG.Current.DEVKIT_DataPath_ER);
+                DisplayEntry(LOC.Get("DEV_KIT_Col_AC6"), ref CFG.Current.DEVKIT_DataPath_AC6);
+                DisplayEntry(LOC.Get("DEV_KIT_Col_NR"), ref CFG.Current.DEVKIT_DataPath_NR);
+
+                ImGui.EndTable();
+            }
+
+            GUI.MultiButtonInput("kitActions",
+                "generateProjects",
+                LOC.Get("DEV_KIT_Action_Generate_Projects"),
+                LOC.Get("DEV_KIT_Action_Generate_Projects_TT"),
+                GenerateProjects);
+        }
+    }
+
+    public void DisplayEntry(string name, ref string cfgPath)
+    {
+        ImGui.TableNextRow();
+        ImGui.TableSetColumnIndex(0);
+
+        ImGui.Text(name);
+
+        ImGui.TableSetColumnIndex(1);
+
+        if (ImGui.Button($"{LOC.Get("DEV_KIT_Action_Select")}##selectDataPath_{name}", DPI.SelectorButtonSize))
+        {
+            var success = PlatformUtils.Instance.OpenFolderDialog(LOC.Get("DEV_KIT_Dialog_Select_Folder"), out var path);
+            if (success)
+            {
+                cfgPath = path;
+            }
+        }
+
+        ImGui.TableSetColumnIndex(2);
+
+        GUI.SetInputWidth();
+        ImGui.InputText($"##dataPath_{name}", ref cfgPath, 255);
+    }
+
+    public void DisplayKitTools()
+    {
+        GUI.Spacer();
+        GUI.SimpleHeader("Target Project", "");
+
+        GUI.SetInputWidth();
+
+        var previewName = LOC.Get(TargetProject.GetDisplayName());
+
+        if (ImGui.BeginCombo("##projectTypePicker", previewName))
+        {
+            foreach (var entry in ProjectTypeOrder.Order)
+            {
+                var type = (ProjectType)entry;
+
+                var displayName = LOC.Get(type.GetDisplayName());
+
+                if (ImGui.Selectable(displayName))
+                {
+                    TargetProject = type;
+
+                }
+            }
+
+            ImGui.EndCombo();
+        }
+
+        if (!GeneratedProjects)
+        {
+            ImGui.Text(LOC.Get("DEV_KIT_No_Projects_Generated_Hint"));
+        }
+        else
+        {
+            GUI.Spacer();
+            ImGui.BeginTabBar("developerKitTabBar");
+
+            if (ImGui.BeginTabItem($"{LOC.Get("DEV_KIT_Tab_Common")}##scriptTab"))
+            {
+                ImGui.BeginChild("commonSection", ImGuiChildFlags.Borders);
+
+                DisplayCommonActions();
+
+                ImGui.EndChild();
+
+                ImGui.EndTabItem();
+            }
+
+            ImGui.EndTabBar();
+        }
+    }
+
+    public void GenerateProjects()
+    {
+        GenerateProject(ProjectType.DES, CFG.Current.DEVKIT_DataPath_DES);
+        GenerateProject(ProjectType.DS1, CFG.Current.DEVKIT_DataPath_DS1);
+        GenerateProject(ProjectType.DS1R, CFG.Current.DEVKIT_DataPath_DS1R);
+        GenerateProject(ProjectType.DS2, CFG.Current.DEVKIT_DataPath_DS2);
+        GenerateProject(ProjectType.DS2S, CFG.Current.DEVKIT_DataPath_DS2S);
+        GenerateProject(ProjectType.DS3, CFG.Current.DEVKIT_DataPath_DS3);
+        GenerateProject(ProjectType.BB, CFG.Current.DEVKIT_DataPath_BB);
+        GenerateProject(ProjectType.SDT, CFG.Current.DEVKIT_DataPath_SDT);
+        GenerateProject(ProjectType.ER, CFG.Current.DEVKIT_DataPath_ER);
+        GenerateProject(ProjectType.AC6, CFG.Current.DEVKIT_DataPath_AC6);
+        GenerateProject(ProjectType.NR, CFG.Current.DEVKIT_DataPath_NR);
+
+        GeneratedProjects = true;
+    }
+
+    public void GenerateProject(ProjectType projectType, string dataPath)
+    {
+        var newProject = new DataProjectEntry();
+        newProject.Descriptor = new()
+        {
+            ProjectType = projectType,
+            DataPath = dataPath
+        };
+
+        var task = newProject.Init();
+        task.Wait();
+
+        Projects.Add(projectType, newProject);
+
+    }
+
+    // Single-click actions
+    public void DisplayCommonActions()
+    {
+        var success = Projects.TryGetValue(TargetProject, out var targetProject);
+
+        if (!success)
+            return;
+
+        GUI.MultiButtonInput("commonActions",
+            "validateFileDictionary",
+            "Validate File Dictionary",
+            "",
+            ValidateFileDictionary,
+
+            "generateSpeedTreeList",
+            "Generate SpeedTree List",
+            "",
+            GenerateSpeedTreeList,
+
+            "generateGrassList",
+            "Generate Grass List",
+            "",
+            GenerateGrassList,
+
+            "generateEdgeList",
+            "Generate Edge List",
+            "",
+            GenerateEdgeList,
+
+            "findHavokInstances",
+            "Find Havok Instances",
+            "",
+            FindHavokInstances,
+
+            "stripTrees",
+            "Strip Tree AEGs",
+            "",
+            StripTrees,
+
+            "stipGrass",
+            "Strip Grass AEGs",
+            "",
+            StripGrass);
+
+        ImGui.InputText("MapID", ref MapID, 255);
+    }
+
+    public string MapID = "";
+
+    #region Validate File Dictionary
+    public void ValidateFileDictionary()
+    {
+        var success = Projects.TryGetValue(TargetProject, out var targetProject);
+        if (!success)
+            return;
+
+        var newFileDictionary = new FileDictionary();
+
+        foreach(var entry in targetProject.Locator.FileDictionary.Entries)
+        {
+            var newFileEntry = entry.Clone();
+
+            var exists = targetProject.VFS.FS.FileExists(entry.Path);
+
+            if(exists)
+            {
+                newFileEntry.Validated = true;
+            }
+            else
+            {
+                newFileEntry.Validated = false;
+            }
+
+            newFileDictionary.Entries.Add(newFileEntry);
+        }
+
+        var writePath = Path.Join(CFG.Current.DEVKIT_DataPath_OutputFolder, "validated_file_dictionary.json");
+        var jsonString = JsonSerializer.Serialize(newFileDictionary, ProjectJsonSerializerContext.Default.FileDictionary);
+        File.WriteAllText(writePath, jsonString);
+    }
+
+    #endregion
+
+    #region Generate Speed Tree List
+    public Dictionary<ProjectType, List<string>> SpeedTreeAssets = new();
+
+    public void GenerateSpeedTreeList()
+    {
+        var success = Projects.TryGetValue(TargetProject, out var targetProject);
+        if (!success)
+            return;
+
+        if(!SpeedTreeAssets.ContainsKey(targetProject.Descriptor.ProjectType))
+        {
+            SpeedTreeAssets.Add(targetProject.Descriptor.ProjectType, new List<string>());
+        }
+
+        var mapPieceAssets = targetProject.Locator.MapPieceFiles;
+        foreach (var entry in mapPieceAssets.Entries)
+        {
+            if (targetProject.VFS.FS.FileExists(entry.Path))
+            {
+                try
+                {
+                    var data = targetProject.VFS.FS.ReadFile(entry.Path);
+
+                    var binder = BND4.Read(data.Value);
+                    var flverFile = binder.Files.FirstOrDefault(e => e.Name.ToLower().Contains(".flver"));
+
+                    if (flverFile != null)
+                    {
+                        var flver = FLVER2.Read(flverFile.Bytes);
+                        if (flver.IsSpeedtree())
+                        {
+                            SpeedTreeAssets[targetProject.Descriptor.ProjectType].Add(entry.Filename);
+                            Smithbox.Log(this, $"SpeedTree added: {entry.Filename}");
+                        }
+
+                        flver = null;
+                    }
+
+                    binder = null;
+                }
+                catch (Exception ex)
+                {
+                    Smithbox.LogError(this, ex.ToString());
+                }
+            }
+        }
+
+        var assets = targetProject.Locator.AssetFiles;
+        foreach(var entry in assets.Entries)
+        {
+            if (targetProject.VFS.FS.FileExists(entry.Path))
+            {
+                try
+                {
+                    var data = targetProject.VFS.FS.ReadFile(entry.Path);
+
+                    var binder = BND4.Read(data.Value);
+                    var flverFile = binder.Files.FirstOrDefault(e => e.Name.ToLower().Contains(".flver"));
+
+                    if (flverFile != null)
+                    {
+                        var flver = FLVER2.Read(flverFile.Bytes);
+                        if (flver.IsSpeedtree())
+                        {
+                            SpeedTreeAssets[targetProject.Descriptor.ProjectType].Add(entry.Filename);
+                            Smithbox.Log(this, $"SpeedTree added: {entry.Filename}");
+                        }
+
+                        flver = null;
+                    }
+
+                    binder = null;
+                }
+                catch (Exception ex)
+                {
+                    Smithbox.LogError(this, ex.ToString());
+                }
+            }
+        }
+
+        foreach (var entry in SpeedTreeAssets)
+        {
+            var writePath = Path.Join(CFG.Current.DEVKIT_DataPath_OutputFolder, $"{entry.Key}_SpeedTreeAssets.json");
+
+            var speedTreeList = new SpeedTreeList();
+
+            foreach(var val in entry.Value)
+            {
+                speedTreeList.Entries.Add(val);
+            }
+
+            var jsonString = JsonSerializer.Serialize(speedTreeList, MapEditorJsonSerializerContext.Default.SpeedTreeList);
+            File.WriteAllText(writePath, jsonString);
+        }
+    }
+    #endregion
+
+    #region Generate Grass List
+
+    public Dictionary<ProjectType, List<string>> GrassAssets = new();
+
+    public void GenerateGrassList()
+    {
+        var success = Projects.TryGetValue(TargetProject, out var targetProject);
+        if (!success)
+            return;
+
+        if (!GrassAssets.ContainsKey(targetProject.Descriptor.ProjectType))
+        {
+            GrassAssets.Add(targetProject.Descriptor.ProjectType, new List<string>());
+        }
+
+        var mapPieceAssets = targetProject.Locator.MapPieceFiles;
+        foreach (var entry in mapPieceAssets.Entries)
+        {
+            if (targetProject.VFS.FS.FileExists(entry.Path))
+            {
+                try
+                {
+                    var data = targetProject.VFS.FS.ReadFile(entry.Path);
+
+                    var binder = BND4.Read(data.Value);
+                    var grassFile = binder.Files.FirstOrDefault(e => e.Name.ToLower().Contains(".grass"));
+
+                    if (grassFile != null)
+                    {
+                        GrassAssets[targetProject.Descriptor.ProjectType].Add(entry.Filename);
+                        Smithbox.Log(this, $"GRASS added: {entry.Filename}");
+                    }
+
+                    binder = null;
+                }
+                catch (Exception ex)
+                {
+                    Smithbox.LogError(this, ex.ToString());
+                }
+            }
+        }
+
+        var assets = targetProject.Locator.AssetFiles;
+        foreach (var entry in assets.Entries)
+        {
+            if (targetProject.VFS.FS.FileExists(entry.Path))
+            {
+                try
+                {
+                    var data = targetProject.VFS.FS.ReadFile(entry.Path);
+
+                    var binder = BND4.Read(data.Value);
+                    var grassFile = binder.Files.FirstOrDefault(e => e.Name.ToLower().Contains(".grass"));
+
+                    if (grassFile != null)
+                    {
+                        GrassAssets[targetProject.Descriptor.ProjectType].Add(entry.Filename);
+                        Smithbox.Log(this, $"GRASS added: {entry.Filename}");
+                    }
+
+                    binder = null;
+                }
+                catch (Exception ex)
+                {
+                    Smithbox.LogError(this, ex.ToString());
+                }
+            }
+        }
+
+        foreach (var entry in GrassAssets)
+        {
+            var writePath = Path.Join(CFG.Current.DEVKIT_DataPath_OutputFolder, $"{entry.Key}_GrassAssets.json");
+
+            var grassList = new GrassList();
+
+            foreach (var val in entry.Value)
+            {
+                grassList.Entries.Add(val);
+            }
+
+            var jsonString = JsonSerializer.Serialize(grassList, MapEditorJsonSerializerContext.Default.GrassList);
+            File.WriteAllText(writePath, jsonString);
+        }
+    }
+
+    #endregion
+
+    #region Generate Edge List
+
+    public Dictionary<ProjectType, List<string>> EdgeAssets = new();
+
+    public void GenerateEdgeList()
+    {
+        var success = Projects.TryGetValue(TargetProject, out var targetProject);
+        if (!success)
+            return;
+
+        if (!EdgeAssets.ContainsKey(targetProject.Descriptor.ProjectType))
+        {
+            EdgeAssets.Add(targetProject.Descriptor.ProjectType, new List<string>());
+        }
+
+        var mapPieceAssets = targetProject.Locator.MapPieceFiles;
+        foreach (var entry in mapPieceAssets.Entries)
+        {
+            if (targetProject.VFS.FS.FileExists(entry.Path))
+            {
+                try
+                {
+                    var data = targetProject.VFS.FS.ReadFile(entry.Path);
+
+                    var binder = BND4.Read(data.Value);
+                    var grassFile = binder.Files.FirstOrDefault(e => e.Name.ToLower().Contains(".edge"));
+
+                    if (grassFile != null)
+                    {
+                        EdgeAssets[targetProject.Descriptor.ProjectType].Add(entry.Filename);
+                        Smithbox.Log(this, $"EDGE added: {entry.Filename}");
+                    }
+
+                    binder = null;
+                }
+                catch (Exception ex)
+                {
+                    Smithbox.LogError(this, ex.ToString());
+                }
+            }
+        }
+
+        var assets = targetProject.Locator.AssetFiles;
+        foreach (var entry in assets.Entries)
+        {
+            if (targetProject.VFS.FS.FileExists(entry.Path))
+            {
+                try
+                {
+                    var data = targetProject.VFS.FS.ReadFile(entry.Path);
+
+                    var binder = BND4.Read(data.Value);
+                    var grassFile = binder.Files.FirstOrDefault(e => e.Name.ToLower().Contains(".edge"));
+
+                    if (grassFile != null)
+                    {
+                        EdgeAssets[targetProject.Descriptor.ProjectType].Add(entry.Filename);
+                        Smithbox.Log(this, $"EDGE added: {entry.Filename}");
+                    }
+
+                    binder = null;
+                }
+                catch (Exception ex)
+                {
+                    Smithbox.LogError(this, ex.ToString());
+                }
+            }
+        }
+
+        foreach (var entry in EdgeAssets)
+        {
+            var writePath = Path.Join(CFG.Current.DEVKIT_DataPath_OutputFolder, $"{entry.Key}_EdgeAssets.json");
+
+            var grassList = new GrassList();
+
+            foreach (var val in entry.Value)
+            {
+                grassList.Entries.Add(val);
+            }
+
+            var jsonString = JsonSerializer.Serialize(grassList, MapEditorJsonSerializerContext.Default.GrassList);
+            File.WriteAllText(writePath, jsonString);
+        }
+    }
+
+    #endregion
+
+    #region Find Havok Instances
+    public Dictionary<FileDictionaryEntry, Dictionary<string, hkRootLevelContainer>> MapCollisionBank = new();
+
+    public void FindHavokInstances()
+    {
+        var success = Projects.TryGetValue(TargetProject, out var targetProject);
+        if (!success)
+            return;
+
+        MapCollisionBank.Clear();
+
+        // Load all map collision files
+        foreach (var entry in targetProject.Locator.HavokCollisionFiles.Entries)
+        {
+            if (!MapCollisionBank.ContainsKey(entry))
+                MapCollisionBank.Add(entry, new Dictionary<string, hkRootLevelContainer>());
+
+            if (entry.Path.Contains("60_"))
+                continue;
+
+            if (entry.Path.Contains("61_"))
+                continue;
+
+            var bhdPath = entry.Path;
+            var bdtPath = entry.Path.Replace("bhd", "bdt");
+
+            var bdtData = targetProject.VFS.FS.ReadFile(bdtPath);
+            var bhdData = targetProject.VFS.FS.ReadFile(bhdPath);
+
+            if (bdtData == null || bhdData == null)
+                return;
+
+            var packedBinder = BXF4.Read((Memory<byte>)bhdData, (Memory<byte>)bdtData);
+
+            HavokBinarySerializer serializer = new HavokBinarySerializer();
+
+            // Get compendium
+            byte[] compendiumFileBytes = null;
+
+            foreach (var file in packedBinder.Files)
+            {
+                if (file.Name.Contains(".compendium.dcx"))
+                {
+                    compendiumFileBytes = DCX.Decompress(file.Bytes).ToArray();
+                }
+                else if (file.Name.Contains(".compendium"))
+                {
+                    compendiumFileBytes = file.Bytes.ToArray();
+                }
+            }
+
+            if (compendiumFileBytes != null)
+            {
+                using MemoryStream memoryStream = new MemoryStream(compendiumFileBytes);
+                serializer.LoadCompendium(memoryStream);
+            }
+
+            foreach (var file in packedBinder.Files)
+            {
+                MapCollisionBank[entry].Add(file.Name, null);
+
+                byte[] fileBytes = null;
+
+                if (file.Name.Contains(".dcx"))
+                {
+                    fileBytes = DCX.Decompress(file.Bytes).ToArray();
+                }
+                else
+                {
+                    fileBytes = file.Bytes.ToArray();
+                }
+
+                using (MemoryStream memoryStream = new MemoryStream(fileBytes))
+                {
+                    hkRootLevelContainer fileHkx;
+
+                    try
+                    {
+                        fileHkx = (hkRootLevelContainer)serializer.Read(memoryStream);
+
+                        MapCollisionBank[entry][file.Name] = fileHkx;
+                    }
+                    catch (InvalidDataException ex)
+                    {
+                        Smithbox.LogError(this, "", ex);
+                    }
+                }
+            }
+        }
+
+        foreach(var entry in MapCollisionBank.Values)
+        {
+            foreach (var (key, file) in entry)
+            {
+                CheckHavokFile(key, file);
+            }
+        }
+
+        var sb = new StringBuilder();
+        foreach(var (filename, listEntry) in Results)
+        {
+            sb.AppendLine(filename);
+            foreach(var mat in listEntry)
+            {
+                sb.AppendLine($"--------");
+                sb.AppendLine($"{mat.m_name}");
+                sb.AppendLine($"--------");
+                sb.AppendLine($"{mat.m_materialId}");
+                sb.AppendLine($"->");
+                sb.AppendLine($"{mat.m_material.m_material.m_name}");
+            }
+        }
+
+        PlatformUtils.Instance.SetClipboardText( sb.ToString() );
+    }
+
+    public HavokPropertyCache HavokPropertyCache = new();
+
+    public Dictionary<string, List<hknpMaterialDescriptor>> Results = new();
+
+    public void CheckHavokFile(string filename, hkRootLevelContainer root)
+    {
+        var materials = HavokTreeSearch.FindAll<hknpMaterialDescriptor>(root, HavokPropertyCache.GetCachedHavokFields);
+
+        if(materials.Count > 0)
+        {
+            Results.Add(filename, materials);
+        }
+    }
+
+    public void LoadCombinedHavokFile(DataProjectEntry project, FileDictionaryEntry fileEntry, string internalFilePath)
+    {
+        if (!MapCollisionBank.ContainsKey(fileEntry))
+            return;
+
+        var curTopDict = MapCollisionBank[fileEntry];
+
+        if (!curTopDict.ContainsKey(internalFilePath))
+            return;
+
+        var bhdPath = fileEntry.Path;
+        var bdtPath = fileEntry.Path.Replace("bhd", "bdt");
+
+        var name = Path.GetFileNameWithoutExtension(internalFilePath);
+
+        try
+        {
+            var bdtData = project.VFS.FS.ReadFile(bdtPath);
+            var bhdData = project.VFS.FS.ReadFile(bhdPath);
+
+            if (bdtData == null || bhdData == null)
+                return;
+
+            var packedBinder = BXF4.Read((Memory<byte>)bhdData, (Memory<byte>)bdtData);
+
+            HavokBinarySerializer serializer = new HavokBinarySerializer();
+
+            // Get compendium
+            byte[] compendiumFileBytes = null;
+
+            foreach (var file in packedBinder.Files)
+            {
+                if (file.Name.Contains(".compendium.dcx"))
+                {
+                    compendiumFileBytes = DCX.Decompress(file.Bytes).ToArray();
+                }
+                else if (file.Name.Contains(".compendium"))
+                {
+                    compendiumFileBytes = file.Bytes.ToArray();
+                }
+            }
+
+            if (compendiumFileBytes != null)
+            {
+                using MemoryStream memoryStream = new MemoryStream(compendiumFileBytes);
+                serializer.LoadCompendium(memoryStream);
+            }
+
+            foreach (var file in packedBinder.Files)
+            {
+                if (file.Name != internalFilePath)
+                    continue;
+
+                byte[] fileBytes = null;
+
+                if (file.Name.Contains(".dcx"))
+                {
+                    fileBytes = DCX.Decompress(file.Bytes).ToArray();
+                }
+                else
+                {
+                    fileBytes = file.Bytes.ToArray();
+                }
+
+                using (MemoryStream memoryStream = new MemoryStream(fileBytes))
+                {
+                    hkRootLevelContainer fileHkx;
+
+                    try
+                    {
+                        fileHkx = (hkRootLevelContainer)serializer.Read(memoryStream);
+
+                        MapCollisionBank[fileEntry][internalFilePath] = fileHkx;
+                    }
+                    catch (InvalidDataException ex)
+                    {
+                        Smithbox.LogError(this, "", ex);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Smithbox.LogError(this, "", ex);
+        }
+    }
+
+    #endregion
+
+    #region Strip Trees from Maps
+    public void StripTrees()
+    {
+        var success = Projects.TryGetValue(TargetProject, out var targetProject);
+        if (!success)
+            return;
+
+        var treeList = SetupSpeedTreeList(targetProject);
+
+        var maps = targetProject.Locator.MapFiles;
+
+        foreach(var mapEntry in maps.Entries)
+        {
+            var mapData = targetProject.VFS.FS.ReadFile(mapEntry.Path);
+            if (mapData != null)
+            {
+                var map = MSBE.Read(mapData.Value);
+
+                StripTreesFromMap(targetProject, map, treeList);
+
+                var outputMapData = map.Write();
+
+                targetProject.VFS.ProjectFS.WriteFile(mapEntry.Path, outputMapData);
+            }
+        }
+    }
+
+    public void StripTreesFromMap(DataProjectEntry project, MSBE map, SpeedTreeList treeList)
+    {
+        var removalList = new List<MSBE.Part.Asset>();
+
+        foreach(var entry in map.Parts.Assets)
+        {
+            if(treeList.Entries.Contains(entry.ModelName.ToLower()))
+            {
+                removalList.Add(entry);
+            }
+        }
+
+        foreach(var entry in removalList)
+        {
+            map.Parts.Assets.Remove(entry);
+        }
+    }
+
+    public SpeedTreeList SetupSpeedTreeList(DataProjectEntry project)
+    {
+        var sourcePath = Path.Join(AppContext.BaseDirectory, "Assets", "MSB", ProjectUtils.GetGameDirectory(project.Descriptor.ProjectType), "SpeedTreeAssets.json");
+
+        if (File.Exists(sourcePath))
+        {
+            var file = File.ReadAllText(sourcePath);
+            try
+            {
+                var speedTreeList = JsonSerializer.Deserialize(file, MapEditorJsonSerializerContext.Default.SpeedTreeList);
+
+                return speedTreeList;
+            }
+            catch (Exception e)
+            {
+                Smithbox.LogError(this,
+                    LOC.Get("MAP_Data_Setup_Failed_Deserialize_Speed_Tree_List", file), e);
+            }
+        }
+
+        return null;
+    }
+
+    #endregion
+
+    #region Strip Grass from Models
+    public void StripGrass()
+    {
+        var success = Projects.TryGetValue(TargetProject, out var targetProject);
+        if (!success)
+            return;
+
+        var grassList = SetupGrassList(targetProject);
+
+        // Assets
+        //foreach (var aegEntry in targetProject.Locator.AssetFiles.Entries)
+        //{
+        //    var mapData = targetProject.VFS.FS.ReadFile(mapEntry.Path);
+        //    if (mapData != null)
+        //    {
+        //        var map = MSBE.Read(mapData.Value);
+
+
+        //        var outputMapData = map.Write();
+
+        //        targetProject.VFS.ProjectFS.WriteFile(mapEntry.Path, outputMapData);
+        //    }
+        //}
+
+        // Map Pieces
+    }
+
+    public GrassList SetupGrassList(DataProjectEntry project)
+    {
+        var sourcePath = Path.Join(AppContext.BaseDirectory, "Assets", "MSB", ProjectUtils.GetGameDirectory(project.Descriptor.ProjectType), "GrassAssets.json");
+
+        if (File.Exists(sourcePath))
+        {
+            var file = File.ReadAllText(sourcePath);
+            try
+            {
+                var grassList = JsonSerializer.Deserialize(file, MapEditorJsonSerializerContext.Default.GrassList);
+
+                return grassList;
+            }
+            catch (Exception e)
+            {
+                Smithbox.LogError(this,
+                    LOC.Get("MAP_Data_Setup_Failed_Deserialize_Grass_List", file), e);
+            }
+        }
+
+        return null;
+    }
+
+    #endregion
+}

@@ -1,0 +1,748 @@
+﻿using Hexa.NET.ImGui;
+using SoulsFormats;
+using SoulsFormats.KF4;
+using StudioCore.Application;
+using StudioCore.Editors.Common;
+using StudioCore.Editors.MapEditor;
+using StudioCore.Keybinds;
+using StudioCore.Utilities;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Numerics;
+using Veldrid;
+
+namespace StudioCore.Editors.ModelEditor;
+
+public class ModelContentsView : IActionEventHandler
+{
+    public ModelEditorView View;
+    public ProjectEntry Project;
+
+    public string ImguiID = "ModelContentView";
+    private int treeImGuiId = 0;
+
+    private bool _setNextFocus;
+    private ISelectable _pendingClick;
+    private HashSet<Entity> _treeOpenEntities = new();
+
+    private string ContentTreeFilter = "";
+    private bool ExactContentTreeFilter = false;
+
+    public ModelContentsView(ModelEditorView view, ProjectEntry project)
+    {
+        View = view;
+        Project = project;
+
+        view.ViewportActionManager.AddEventHandler(this);
+        view.ActionManager.AddEventHandler(this);
+    }
+
+    public void Display(float width, float height)
+    {
+        GUI.TitleHeader(
+            LOC.Get("MODEL_Contents_Header"),
+            LOC.Get("MODEL_Contents_Header_TT"));
+
+        DisplayHeader();
+
+        ImGui.BeginChild("ModelContents", new Vector2(0, 0), ImGuiChildFlags.Borders);
+
+        if (View.Selection.SelectedModelWrapper != null && 
+            View.Selection.SelectedModelWrapper.FLVER != null)
+        {
+            treeImGuiId = 0;
+
+            var container = View.Selection.SelectedModelWrapper.Container;
+
+            if (container != null)
+            {
+                DisplayContentTree(container);
+            }
+        }
+        else
+        {
+            ImGui.Text(LOC.Get("MODEL_Contents_No_Flver_Hint"));
+        }
+
+        ImGui.EndChild();
+    }
+
+    public void DisplayHeader()
+    {
+        ImGui.BeginChild($"framedListFilter_modelEditor_ContentTree", EditorFilters.GetHeaderSize(), ImGuiChildFlags.Borders);
+
+        EditorFilters.DisplaySearchbar("modelEditor_ContentTree",
+            ref ContentTreeFilter, ref ExactContentTreeFilter);
+
+        var wrapper = View.Selection.SelectedModelWrapper;
+
+        ImGui.SameLine();
+
+        // Show All
+        ImGui.SameLine();
+        if (ImGui.Button($"{Icons.Eye}", DPI.IconButtonSize))
+        {
+            if (wrapper != null && wrapper.Container != null)
+            {
+                foreach (var entry in wrapper.Container.Objects)
+                {
+                    entry.EditorVisible = true;
+                }
+            }
+        }
+        GUI.Tooltip(LOC.Get("MODEL_Contents_Toggle_Show_All_TT"));
+
+        // Hide All
+        ImGui.SameLine();
+        if (ImGui.Button($"{Icons.EyeSlash}", DPI.IconButtonSize))
+        {
+            if (wrapper != null && wrapper.Container != null)
+            {
+                foreach (var entry in wrapper.Container.Objects)
+                {
+                    entry.EditorVisible = false;
+                }
+            }
+        }
+        GUI.Tooltip(LOC.Get("MODEL_Contents_Toggle_Hide_All_TT"));
+
+
+        // Auto-Open Tree
+        ImGui.SameLine();
+        if (ImGui.Button($"{Icons.Tree}##toggleAutoOpen"))
+        {
+            CFG.Current.ModelEditor_Contents_Auto_Open_Tree = !CFG.Current.ModelEditor_Contents_Auto_Open_Tree;
+        }
+
+        var autoTreeMode = LOC.Get("MODEL_Contents_TreeState_Open");
+        if (CFG.Current.ModelEditor_Contents_Auto_Open_Tree)
+            autoTreeMode = LOC.Get("MODEL_Contents_TreeState_Closed");
+
+        GUI.Tooltip(LOC.Get("MODEL_Contents_TreeState_TT", autoTreeMode));
+
+        ImGui.EndChild();
+    }
+
+    public bool CanDisplayModelObject(ModelContainer container, ModelEntity entity)
+    {
+        return true;
+    }
+
+    public void DisplayContentTree(ModelContainer container)
+    {
+        ImGui.BeginChild($"modelContentsTree_{ImguiID}");
+
+        Entity modelRoot = container?.RootObject;
+        ObjectContainerReference modelRef = new(container.Name);
+
+        ISelectable selectTarget = (ISelectable)modelRoot ?? modelRef;
+
+        ImGuiTreeNodeFlags treeflags = ImGuiTreeNodeFlags.OpenOnArrow | ImGuiTreeNodeFlags.SpanAvailWidth;
+
+        if (CFG.Current.ModelEditor_Contents_Auto_Open_Tree)
+        {
+            treeflags = treeflags | ImGuiTreeNodeFlags.DefaultOpen;
+        }
+
+        var selected = View.ViewportSelection.GetSelection().Contains(modelRoot) || 
+            View.ViewportSelection.GetSelection().Contains(modelRef);
+
+        if (selected)
+        {
+            treeflags |= ImGuiTreeNodeFlags.Selected;
+        }
+
+        var nodeopen = false;
+        var unsaved = container != null && container.HasUnsavedChanges ? "*" : "";
+
+        ImGui.BeginGroup();
+
+        string treeNodeName = $@"{Icons.Cube} {container.Name}";
+        string treeNodeNameFormat = $@"{Icons.Cube} {container.Name}{unsaved}";
+
+        nodeopen = ImGui.TreeNodeEx(treeNodeName, treeflags, treeNodeNameFormat);
+
+        // TODO: alias
+
+        ImGui.EndGroup();
+
+        if (View.ViewportSelection.ShouldGoto(modelRoot) || View.ViewportSelection.ShouldGoto(modelRef))
+        {
+            ImGui.SetScrollHereY();
+            View.ViewportSelection.ClearGotoTarget();
+        }
+
+        if (nodeopen)
+        {
+            ImGui.Indent(); //TreeNodeEx fails to indent as it is inside a group / indentation is reset
+        }
+
+        DisplayTopContextMenu(container, selected);
+        HandleSelectionClick(selectTarget, modelRoot, modelRef, nodeopen);
+
+        if (nodeopen)
+        {
+            var scale = DPI.UIScale();
+            ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(8.0f, 3.0f) * scale);
+
+            TypeView(container);
+
+            ImGui.PopStyleVar();
+            ImGui.TreePop();
+        }
+
+        ImGui.EndChild();
+    }
+
+    private void TypeView(ModelContainer container)
+    {
+        View.EntityTypeCache.AddModelToCache(container);
+
+        foreach (KeyValuePair<ModelEntityType, Dictionary<Type, List<ModelEntity>>> cats in
+                 View.EntityTypeCache._cachedTypeView[container.Name].OrderBy(q => q.Key.ToString()))
+        {
+            if (cats.Value.Count > 0)
+            {
+                ImGuiTreeNodeFlags treeflags = ImGuiTreeNodeFlags.OpenOnArrow;
+
+                if (CFG.Current.ModelEditor_Contents_Auto_Open_Tree)
+                {
+                    treeflags = treeflags | ImGuiTreeNodeFlags.DefaultOpen;
+                }
+
+                if (ImGui.TreeNodeEx(cats.Key.ToString(), treeflags))
+                {
+                    foreach (KeyValuePair<Type, List<ModelEntity>> typ in cats.Value.OrderBy(q => q.Key.Name))
+                    {
+                        if (typ.Value.Count > 0)
+                        {
+                            int index = 0;
+
+                            foreach (var obj in typ.Value)
+                            {
+                                if (CanDisplayModelObject(container, obj))
+                                {
+                                    ModelObjectSelectable(container, obj, index);
+                                }
+
+                                index++;
+                            }
+                        }
+                        else
+                        {
+                            ImGui.Text($@"   {typ.Key}");
+                        }
+                    }
+
+                    ImGui.TreePop();
+                }
+            }
+            else
+            {
+                ImGui.Text($@"   {cats.Key.ToString()}");
+            }
+        }
+    }
+
+    private void DisplayTopContextMenu(ModelContainer map, bool selected)
+    {
+        if (ImGui.BeginPopupContextItem($@"modelTopContext_{map.Name}"))
+        {
+            // Information
+            if (ImGui.BeginMenu($"{LOC.Get("MODEL_Contents_Context_Info_Header")}##infoMenuHeader"))
+            {
+                // Copy Model Name
+                if (ImGui.Selectable($"{LOC.Get("MODEL_Contents_Action_Copy_Model_Name")}##copyModelNameAction"))
+                {
+                    PlatformUtils.Instance.SetClipboardText(map.Name);
+                }
+                GUI.Tooltip(LOC.Get("MODEL_Contents_Action_Copy_Model_Name_TT"));
+
+                ImGui.EndMenu();
+            }
+
+            ImGui.EndPopup();
+        }
+    }
+
+    private void HandleSelectionClick(ISelectable selectTarget, Entity modelRoot, ObjectContainerReference modelRef, bool nodeopen)
+    {
+        if (ImGui.IsItemClicked())
+        {
+            _pendingClick = selectTarget;
+        }
+
+        if (ImGui.IsMouseDoubleClicked(0) && _pendingClick != null && modelRoot == _pendingClick)
+        {
+            View.ViewportWindow.Viewport?.FramePosition(modelRoot.GetLocalTransform().Position, 10f);
+        }
+
+        if ((_pendingClick == modelRoot || modelRef.Equals(_pendingClick)) && ImGui.IsMouseReleased(ImGuiMouseButton.Left))
+        {
+            if (ImGui.IsItemHovered())
+            {
+                // Only select if a node is not currently being opened/closed
+                if (modelRoot == null || 
+                    nodeopen && _treeOpenEntities.Contains(modelRoot) || 
+                    !nodeopen && !_treeOpenEntities.Contains(modelRoot))
+                {
+                    if (InputManager.HasCtrlDown())
+                    {
+                        // Toggle Selection
+                        if (View.ViewportSelection.GetSelection().Contains(selectTarget))
+                        {
+                            View.ViewportSelection.RemoveSelection(selectTarget);
+                        }
+                        else
+                        {
+                            View.ViewportSelection.AddSelection(selectTarget);
+                        }
+                    }
+                    else
+                    {
+                        View.ViewportSelection.ClearSelection();
+                        View.ViewportSelection.AddSelection(selectTarget);
+                    }
+                }
+
+                // Update the open/closed state
+                if (modelRoot != null)
+                {
+                    if (nodeopen && !_treeOpenEntities.Contains(modelRoot))
+                    {
+                        _treeOpenEntities.Add(modelRoot);
+                    }
+                    else if (!nodeopen && _treeOpenEntities.Contains(modelRoot))
+                    {
+                        _treeOpenEntities.Remove(modelRoot);
+                    }
+                }
+            }
+
+            _pendingClick = null;
+        }
+    }
+
+    private void HierarchyView(ModelContainer container, Entity entity)
+    {
+        foreach (Entity obj in entity.Children)
+        {
+            if (obj is Entity e)
+            {
+                ModelObjectSelectable(container, e, -1, true);
+            }
+        }
+    }
+
+    private unsafe void ModelObjectSelectable(ModelContainer container, Entity e, int index = -1, bool hierarchial = false)
+    {
+        var scale = DPI.UIScale();
+
+        var key = $"{LOC.Get("MODEL_Contents_Entry_Title")} {index}";
+
+        if (e.SupportsName)
+        {
+            if (e.Name != null && e.Name != "null")
+            {
+                key = e.Name;
+            }
+        }
+
+        // Dummy: Ref ID
+        if(e.WrappedObject is FLVER.Dummy)
+        {
+            var dummy = (FLVER.Dummy)e.WrappedObject;
+
+            var parentBone = dummy.ParentBoneIndex;
+
+            if (parentBone != -1)
+            {
+                for (int i = 0; i < container.Nodes.Count; i++)
+                {
+                    var curNode = container.Nodes[i];
+
+                    if (i == parentBone)
+                    {
+                        var node = (FLVER.Node)curNode.WrappedObject;
+
+                        key = $"{node.Name} [{dummy.ReferenceID}]";
+                    }
+                }
+
+            }
+            else
+            {
+                key = $"{key} [{dummy.ReferenceID}]";
+            }
+        }
+
+        // Mesh: Material [Node]
+        if (e.WrappedObject is FLVER2.Mesh)
+        {
+            var mesh = (FLVER2.Mesh)e.WrappedObject;
+
+            var matIndex = mesh.MaterialIndex;
+            var nodeIndex = mesh.NodeIndex;
+
+            var meshName = LOC.Get("MODEL_Contents_Mesh_Title");
+            var nodeName = "";
+
+            if (matIndex != -1)
+            {
+                for (int i = 0; i < container.Materials.Count; i++)
+                {
+                    var curMat = container.Materials[i];
+
+                    if (i == matIndex)
+                    {
+                        var mat = (FLVER2.Material)curMat.WrappedObject;
+
+                        meshName = mat.Name;
+                    }
+                }
+            }
+
+            if (nodeIndex != -1)
+            {
+                for (int i = 0; i < container.Nodes.Count; i++)
+                {
+                    var curNode = container.Nodes[i];
+
+                    if (i == nodeIndex)
+                    {
+                        var node = (FLVER.Node)curNode.WrappedObject;
+
+                        nodeName = $"{node.Name}";
+                    }
+                }
+            }
+
+            if (CFG.Current.ModelEditor_Contents_NodeNameInMeshEntry)
+            {
+                key = $"{meshName} [{nodeName}]";
+            }
+            else
+            {
+                key = $"{meshName}";
+            }
+        }
+
+        // Main selectable
+        if (e is ModelEntity me)
+        {
+            ImGui.PushID(me.Type + key);
+        }
+        else
+        {
+            ImGui.PushID(key);
+        }
+
+        var doSelect = false;
+        if (_setNextFocus)
+        {
+            ImGui.SetItemDefaultFocus();
+            _setNextFocus = false;
+            doSelect = true;
+        }
+
+        var nodeopen = false;
+        var padding = hierarchial ? "   " : "    ";
+
+        var arrowKeySelect = false;
+
+        if (hierarchial && e.Children.Count > 0)
+        {
+            DisplayVisibilityButton(e, container, key, index);
+
+            ImGuiTreeNodeFlags treeflags = ImGuiTreeNodeFlags.OpenOnArrow | ImGuiTreeNodeFlags.SpanAvailWidth;
+
+            if (CFG.Current.ModelEditor_Contents_Auto_Open_Tree)
+            {
+                treeflags = treeflags | ImGuiTreeNodeFlags.DefaultOpen;
+            }
+
+            if (View.ViewportSelection.GetSelection().Contains(e))
+            {
+                treeflags |= ImGuiTreeNodeFlags.Selected;
+            }
+
+            nodeopen = ImGui.TreeNodeEx(e.PrettyName, treeflags);
+            if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(0))
+            {
+                if (e.RenderSceneMesh != null)
+                {
+                    View.FrameAction.FrameCurrentEntity(e);
+                }
+            }
+
+            if (ImGui.IsItemFocused())
+            {
+                if (InputManager.HasArrowSelection())
+                {
+                    doSelect = true;
+                    arrowKeySelect = true;
+                }
+            }
+        }
+        else
+        {
+            treeImGuiId++;
+            var selectableFlags = ImGuiSelectableFlags.AllowDoubleClick | ImGuiSelectableFlags.AllowOverlap;
+
+            var displayName = key;
+
+            var isMatch = EditorFilters.IsMatch(ContentTreeFilter, displayName, ExactContentTreeFilter);
+
+            if (isMatch)
+            {
+                DisplayVisibilityButton(e, container, key, index);
+
+                if (ImGui.Selectable($"{displayName}##{treeImGuiId}", View.ViewportSelection.GetSelection().Contains(e), selectableFlags))
+                {
+                    doSelect = true;
+
+                    // If double clicked frame the selection in the viewport
+                    if (ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+                    {
+                        if (e.RenderSceneMesh != null)
+                        {
+                            View.FrameAction.FrameCurrentEntity(e);
+                        }
+                    }
+                }
+
+                if (ImGui.IsItemFocused())
+                {
+                    if (InputManager.HasArrowSelection())
+                    {
+                        doSelect = true;
+                        arrowKeySelect = true;
+                    }
+                }
+
+                DisplayModelObjectContextMenu(container, e, treeImGuiId);
+            }
+        }
+
+        if (ImGui.IsItemClicked(ImGuiMouseButton.Left))
+        {
+            _pendingClick = e;
+        }
+
+        if (_pendingClick == e && ImGui.IsMouseReleased(ImGuiMouseButton.Left))
+        {
+            if (ImGui.IsItemHovered())
+            {
+                doSelect = true;
+            }
+
+            _pendingClick = null;
+        }
+
+        if (hierarchial && doSelect)
+        {
+            if (nodeopen && !_treeOpenEntities.Contains(e) ||
+                !nodeopen && _treeOpenEntities.Contains(e))
+            {
+                doSelect = false;
+            }
+
+            if (nodeopen && !_treeOpenEntities.Contains(e))
+            {
+                _treeOpenEntities.Add(e);
+
+            }
+            else if (!nodeopen && _treeOpenEntities.Contains(e))
+            {
+                _treeOpenEntities.Remove(e);
+            }
+        }
+
+        if (View.ViewportSelection.ShouldGoto(e))
+        {
+            // By default, this places the item at 50% in the frame. Use 0 to place it on top.
+            ImGui.SetScrollHereY();
+            View.ViewportSelection.ClearGotoTarget();
+        }
+
+        // If the visibility icon wasn't clicked, perform the selection
+        HandleEntitySelection(e, doSelect, arrowKeySelect);
+
+        // If there's children then draw them
+        if (nodeopen)
+        {
+            HierarchyView(container, e);
+            ImGui.TreePop();
+        }
+
+        ImGui.PopID();
+    }
+
+    private void DisplayModelObjectContextMenu(ModelContainer container, Entity ent, int imguiID)
+    {
+        if (ImGui.BeginPopupContextItem($@"modelObjectContext_{container.Name}_{imguiID}"))
+        {
+            View.DuplicateAction.OnContext();
+            View.DeleteAction.OnContext();
+
+            ImGui.Separator();
+
+            View.FrameAction.OnContext();
+            View.PullToCameraAction.OnContext();
+
+            ImGui.Separator();
+
+            View.ReorderAction.OnContext();
+
+            ImGui.EndPopup();
+        }
+    }
+
+    public void DisplayVisibilityButton(Entity entity, ModelContainer container, string key, int index)
+    {
+        // Visibility icon
+        var icon = entity.EditorVisible ? Icons.Eye : Icons.EyeSlash;
+
+        ImGui.PushItemFlag(ImGuiItemFlags.NoNav, true);
+        ImGui.PushStyleColor(ImGuiCol.Button, Vector4.Zero);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Vector4.Zero);
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, Vector4.Zero);
+        ImGui.PushStyleColor(ImGuiCol.Border, Vector4.Zero);
+
+        if (ImGui.Button($"{icon}##modelObjectVisibility{key}{index}", DPI.InlineIconButtonSize))
+        {
+            if (InputManager.IsPressed(KeybindID.Apply_to_All))
+            {
+                foreach (var entry in container.RootObject.Children)
+                {
+                    if (entry.WrappedObject.GetType() == entity.WrappedObject.GetType())
+                    {
+                        entry.EditorVisible = !entry.EditorVisible;
+                    }
+                }
+            }
+            else
+            {
+                entity.EditorVisible = !entity.EditorVisible;
+            }
+        }
+        ImGui.PopStyleColor(4);
+        ImGui.PopItemFlag();
+        ImGui.SameLine();
+
+        GUI.Tooltip(LOC.Get("MODEL_Contents_Visibility_Button_TT"));
+
+    }
+
+    public void HandleEntitySelection(Entity entity, bool itemSelected, bool isItemFocused, List<WeakReference<Entity>> filteredEntityList = null)
+    {
+        // Up/Down arrow mass selection
+        var arrowKeySelect = false;
+
+        if (isItemFocused && InputManager.HasArrowSelection())
+        {
+            itemSelected = true;
+            arrowKeySelect = true;
+        }
+
+        if (itemSelected)
+        {
+            if (arrowKeySelect)
+            {
+                if (InputManager.HasCtrlDown() || InputManager.HasShiftDown())
+                {
+                    View.ViewportSelection.AddSelection(entity);
+                }
+                else
+                {
+                    View.ViewportSelection.ClearSelection();
+                    View.ViewportSelection.AddSelection(entity);
+                }
+            }
+            else if (InputManager.HasCtrlDown())
+            {
+                // Toggle Selection
+                if (View.ViewportSelection.GetSelection().Contains(entity))
+                {
+                    View.ViewportSelection.RemoveSelection(entity);
+                }
+                else
+                {
+                    View.ViewportSelection.AddSelection(entity);
+                }
+            }
+            else if (View.ViewportSelection.GetSelection().Count > 0
+                     && InputManager.HasShiftDown())
+            {
+                // Select Range
+                List<Entity> entList;
+                if (filteredEntityList != null)
+                {
+                    entList = new();
+                    foreach (WeakReference<Entity> ent in filteredEntityList)
+                    {
+                        if (ent.TryGetTarget(out Entity e))
+                        {
+                            entList.Add(e);
+                        }
+                    }
+                }
+                else
+                {
+                    entList = entity.Container.Objects;
+                }
+
+                var i1 = -1;
+
+                if (entity.GetType() == typeof(ModelEntity))
+                {
+                    i1 = entList.IndexOf(View.ViewportSelection.GetFilteredSelection<ModelEntity>()
+                        .FirstOrDefault(fe => fe.Container == entity.Container && fe != entity.Container.RootObject));
+                }
+
+                var i2 = -1;
+
+                if (entity.GetType() == typeof(ModelEntity))
+                {
+                    i2 = entList.IndexOf((ModelEntity)entity);
+                }
+
+                if (i1 != -1 && i2 != -1)
+                {
+                    var iStart = i1;
+                    var iEnd = i2;
+                    if (i2 < i1)
+                    {
+                        iStart = i2;
+                        iEnd = i1;
+                    }
+
+                    for (var i = iStart; i <= iEnd; i++)
+                    {
+                        View.ViewportSelection.AddSelection(entList[i]);
+                    }
+                }
+                else
+                {
+                    View.ViewportSelection.AddSelection(entity);
+                }
+            }
+            else
+            {
+                // Exclusive Selection
+                View.ViewportSelection.ClearSelection();
+                View.ViewportSelection.AddSelection(entity);
+            }
+        }
+    }
+
+    // This updates the model content tree when actions occur
+    public void OnActionEvent(ActionEvent evt)
+    {
+        if (evt.HasFlag(ActionEvent.ObjectAddedRemoved))
+        {
+            View.EntityTypeCache.InvalidateCache();
+        }
+    }
+}

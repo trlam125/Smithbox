@@ -1,0 +1,202 @@
+﻿using Hexa.NET.ImGui;
+using StudioCore.Application;
+using StudioCore.Editors.Common;
+using StudioCore.Keybinds;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Numerics;
+
+namespace StudioCore.Editors.MaterialEditor;
+
+/// <summary>
+/// The list of each discrete material entry (.MTD or .MATBIN)
+/// </summary>
+public class MaterialFileList
+{
+    public MaterialEditorView Parent;
+    public ProjectEntry Project;
+
+    private string FileListFilter = "";
+    private bool ExactFileListFilter = false;
+
+    public MaterialFileList(MaterialEditorView view, ProjectEntry project)
+    {
+        Parent = view;
+        Project = project;
+    }
+
+    public void Draw(float width, float height)
+    {
+        DisplayTitle();
+        DisplayHeader();
+        DisplayFileList(width, height);
+
+    }
+
+    public void DisplayTitle()
+    {
+        // File List
+        GUI.TitleHeader(
+            LOC.Get("MAT_FileList_Header_File_List"),
+            LOC.Get("MAT_FileList_Header_File_List_TT"));
+    }
+
+    public void DisplayHeader()
+    {
+        ImGui.BeginChild("MaterialFileListHeaderSection", EditorFilters.GetHeaderSize(), ImGuiChildFlags.Borders);
+
+        EditorFilters.DisplaySearchbar("materialEditor_FileList",
+            ref FileListFilter, ref ExactFileListFilter);
+
+        // Display Path
+        ImGui.SameLine();
+
+        if (ImGui.Button($"{Icons.Bars}"))
+        {
+            CFG.Current.MaterialEditor_FileList_DisplayFullPath = !CFG.Current.MaterialEditor_FileList_DisplayFullPath;
+        }
+
+        var displayPathMode = LOC.Get("MAT_FileList_DisplayFullPath_Toggle_Hide");
+        if (CFG.Current.MaterialEditor_FileList_DisplayFullPath)
+            displayPathMode = LOC.Get("MAT_FileList_DisplayFullPath_Toggle_Show");
+
+        GUI.Tooltip(LOC.Get("MAT_FileList_DisplayFullPath_Toggle_Hint", displayPathMode));
+
+        ImGui.EndChild();
+    }
+
+    public void DisplayFileList(float width, float height)
+    {
+        ImGui.BeginChild("FileList", new Vector2(width, height), ImGuiChildFlags.Borders);
+
+        // MTD
+        if (Parent.Selection.SourceType is MaterialSourceType.MTD && Parent.Selection.MTDWrapper != null)
+        {
+            var files = Parent.Selection.MTDWrapper.Entries;
+
+            var filteredEntries = new List<string>();
+            foreach (var entry in files)
+            {
+                var isMatch = EditorFilters.IsMatch(FileListFilter, entry.Key, ExactFileListFilter);
+
+                if (isMatch)
+                {
+                    filteredEntries.Add(entry.Key);
+                }
+            }
+
+            var clipper = new ImGuiListClipper();
+            clipper.Begin(filteredEntries.Count);
+
+            while (clipper.Step())
+            {
+                for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
+                {
+                    var key = filteredEntries[i];
+                    var curFile = Parent.Selection.MTDWrapper.Entries[key];
+
+                    var displayName = GetPrettyName($"{key}");
+
+                    if (ImGui.Selectable($"{displayName}##mtdFileEntry_{key}{i}", key == Parent.Selection.SelectedFileKey, ImGuiSelectableFlags.AllowDoubleClick))
+                    {
+                        Parent.Selection.SelectedFileKey = key;
+                        Parent.Selection.SelectedMTD = curFile;
+                    }
+
+                    // Arrow Selection
+                    if (ImGui.IsItemHovered() && Parent.Selection.SelectFileListEntry)
+                    {
+                        Parent.Selection.SelectFileListEntry = false;
+
+                        Parent.Selection.SelectedFileKey = key;
+                        Parent.Selection.SelectedMTD = curFile;
+                    }
+
+                    if (ImGui.IsItemFocused())
+                    {
+                        if (InputManager.HasArrowSelection())
+                        {
+                            Parent.Selection.SelectFileListEntry = true;
+                        }
+                    }
+                }
+            }
+
+            clipper.End();
+        }
+
+        // MATBIN
+        if (Parent.Selection.SourceType is MaterialSourceType.MATBIN && MaterialUtils.SupportsMATBIN(Project))
+        {
+            if (Parent.Selection.MATBINWrapper != null)
+            {
+                var files = Parent.Selection.MATBINWrapper.Entries;
+
+                var filteredEntries = new List<string>();
+                foreach (var entry in files)
+                {
+                    var isMatch = EditorFilters.IsMatch(FileListFilter, entry.Key, ExactFileListFilter);
+
+                    if (isMatch)
+                    {
+                        filteredEntries.Add(entry.Key);
+                    }
+                }
+
+                var clipper = new ImGuiListClipper();
+                clipper.Begin(filteredEntries.Count);
+
+                while (clipper.Step())
+                {
+                    for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
+                    {
+                        var key = filteredEntries[i];
+                        var curFile = Parent.Selection.MATBINWrapper.Entries[key];
+
+                        var displayName = GetPrettyName($"{key}");
+
+                        if (ImGui.Selectable($"{displayName}##matbinFileEntry_{key}", key == Parent.Selection.SelectedFileKey, ImGuiSelectableFlags.AllowDoubleClick))
+                        {
+                            Parent.Selection.SelectedFileKey = key;
+                            Parent.Selection.SelectedMATBIN = curFile;
+                        }
+
+                        // Arrow Selection
+                        if (ImGui.IsItemHovered() && Parent.Selection.SelectFileListEntry)
+                        {
+                            Parent.Selection.SelectFileListEntry = false;
+
+                            Parent.Selection.SelectedFileKey = key;
+                            Parent.Selection.SelectedMATBIN = curFile;
+                        }
+
+                        if (ImGui.IsItemFocused())
+                        {
+                            if (InputManager.HasArrowSelection())
+                            {
+                                Parent.Selection.SelectFileListEntry = true;
+                            }
+                        }
+                    }
+                }
+
+                clipper.End();
+            }
+        }
+
+        ImGui.EndChild();
+    }
+
+    public string GetPrettyName(string path)
+    {
+        var newName = path;
+
+        if(!CFG.Current.MaterialEditor_FileList_DisplayFullPath)
+        {
+            newName = Path.GetFileNameWithoutExtension(newName);
+        }
+
+        return newName;
+    }
+}

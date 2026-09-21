@@ -1,0 +1,80 @@
+﻿using StudioCore.Editors.MapEditor;
+using StudioCore.Renderer;
+
+namespace StudioCore.Editors.Common;
+
+
+/// <summary>
+/// Special entity for the placement orb
+/// </summary>
+public class PlacementEntity : Entity
+{
+    protected IUniverse Owner;
+
+    /// <summary>
+    /// Constructor
+    /// </summary>
+    public PlacementEntity(IUniverse owner) : base(owner)
+    {
+        Owner = owner;
+
+        if (owner is MapUniverse)
+        {
+            var universe = (MapUniverse)owner;
+
+            if (Smithbox.Instance.CurrentBackend is RenderingBackend.Vulkan)
+            {
+                this.RenderSceneMesh = DrawableHelper.GetPlacementOrbDrawable(universe.GetCurrentScene(), this);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Update the render model of this entity.
+    /// </summary>
+    public override void UpdateRenderModel()
+    {
+        if(!CFG.Current.Viewport_Enable_Rendering)
+        {
+            return;
+        }
+
+        if(Smithbox.Instance.CurrentBackend is RenderingBackend.OpenGL)
+        {
+            return;
+        }
+
+        // Map Editor
+        if (Owner is MapUniverse)
+        {
+            var universe = (MapUniverse)Owner;
+
+            if (this.RenderSceneMesh != null)
+            {
+                if (CFG.Current.DisplayPlacementOrb)
+                {
+                    this.RenderSceneMesh.Visible = true;
+                }
+                else
+                {
+                    this.RenderSceneMesh.Visible = false;
+                }
+
+                // Update position of the placement orb
+                this.RenderSceneMesh.World = universe.View.ViewportWindow.GetPlacementTransform();
+            }
+        }
+
+        base.UpdateRenderModel();
+    }
+
+    /// <summary>
+    /// Return local transform for this entity.
+    /// </summary>
+    public override Transform GetLocalTransform()
+    {
+        Transform t = base.GetLocalTransform();
+
+        return t;
+    }
+}
