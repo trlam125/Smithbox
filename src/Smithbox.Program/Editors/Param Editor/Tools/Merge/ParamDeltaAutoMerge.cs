@@ -19,7 +19,8 @@ public enum ParamDeltaConflictStrategy
 public enum ParamDeltaMergeConflictType
 {
     FieldValue = 0,
-    RowState = 1
+    RowState = 1,
+    RowName = 2
 }
 
 public enum ParamDeltaConflictResolution
@@ -46,16 +47,21 @@ public sealed class ParamDeltaMergeConflict
     public RowDeltaState IncomingState { get; init; }
     public ParamDeltaConflictResolution Resolution { get; set; } = ParamDeltaConflictResolution.Unresolved;
     public string ManualValue { get; set; } = "";
+    public string ManualValueType { get; init; } = "";
+    public bool ManualValueValid { get; set; } = true;
 
     internal RowDelta ExistingRowSnapshot { get; init; }
     internal RowDelta IncomingRowSnapshot { get; init; }
 
-    public bool IsResolved => Resolution != ParamDeltaConflictResolution.Unresolved;
+    public bool IsResolved =>
+        Resolution != ParamDeltaConflictResolution.Unresolved &&
+        (Resolution != ParamDeltaConflictResolution.Manual || ManualValueValid);
 }
 
 public sealed class ParamDeltaAutoMergeResult
 {
     public ParamDeltaPatch Patch { get; init; } = new();
+    internal ParamDeltaPatch BaselinePatch { get; set; }
     public List<ParamDeltaMergeConflict> Conflicts { get; } = new();
     public List<string> Errors { get; } = new();
     public int SourceCount { get; set; }
@@ -63,6 +69,7 @@ public sealed class ParamDeltaAutoMergeResult
     public int SafeFields { get; set; }
     public int IdenticalFields { get; set; }
     public ParamDeltaConflictStrategy Strategy { get; set; }
+    internal List<DeltaImportEntry> Sources { get; } = new();
 
     public int ResolvedConflicts => Conflicts.Count(e => e.IsResolved);
     public int UnresolvedConflicts => Conflicts.Count - ResolvedConflicts;
@@ -78,10 +85,12 @@ public sealed class ParamDeltaAutoMergeEngine
     {
         public RowDelta Row { get; set; } = new();
         public string RowSource { get; set; } = "";
+        public string NameSource { get; set; } = "";
         public Dictionary<string, string> FieldSources { get; } = new(StringComparer.Ordinal);
     }
 
     private readonly record struct RowKey(string ParamName, int ID, int Index);
+    private readonly record struct ConflictChoice(ParamDeltaConflictResolution Resolution, string ManualValue);
 
     public ParamDeltaAutoMergeEngine(ParamDeltaPatcher patcher)
     {
@@ -100,54 +109,10 @@ public sealed class ParamDeltaAutoMergeEngine
 
     public void ApplyConflictResolutions(ParamDeltaAutoMergeResult result)
     {
-        if (result == null)
+        if (result == null || result.Sources.Count == 0)
             return;
 
-        foreach (var conflict in result.Conflicts)
-        {
-            if (!conflict.IsResolved)
-                continue;
-
-            var param = result.Patch.Params.FirstOrDefault(e => e.Name == conflict.ParamName);
-            if (param == null)
-                continue;
-
-            var row = param.Rows.FirstOrDefault(e => e.ID == conflict.RowID && e.Index == conflict.RowIndex);
-
-            if (conflict.Type == ParamDeltaMergeConflictType.FieldValue)
-            {
-                if (row == null)
-                    continue;
-
-                var field = row.Fields.FirstOrDefault(e => e.Field == conflict.Field);
-                if (field == null)
-                {
-                    field = new FieldDelta { Field = conflict.Field };
-                    row.Fields.Add(field);
-                }
-
-                field.Value = conflict.Resolution switch
-                {
-                    ParamDeltaConflictResolution.UseEarlier => conflict.ExistingValue,
-                    ParamDeltaConflictResolution.UseLater => conflict.IncomingValue,
-                    ParamDeltaConflictResolution.Manual => conflict.ManualValue ?? "",
-                    _ => field.Value
-                };
-                continue;
-            }
-
-            var selected = conflict.Resolution == ParamDeltaConflictResolution.UseLater
-                ? conflict.IncomingRowSnapshot
-                : conflict.ExistingRowSnapshot;
-
-            if (selected == null)
-                continue;
-
-            if (row != null)
-                param.Rows.Remove(row);
-
-            param.Rows.Add(CloneRow(selected));
-        }
+        RebuildMergedState(result, preserveConflictChoices: true);
     }
 
     public ParamDeltaAutoMergeResult Merge(
@@ -176,9 +141,41 @@ public sealed class ParamDeltaAutoMergeEngine
         if (result.Errors.Count > 0)
             return result;
 
+        foreach (var source in sources)
+        {
+            result.Sources.Add(new DeltaImportEntry
+            {
+                Filename = source.Filename,
+                Delta = ClonePatch(source.Delta)
+            });
+        }
+
+        RebuildMergedState(result, preserveConflictChoices: false);
+        return result;
+    }
+
+    private void RebuildMergedState(ParamDeltaAutoMergeResult result, bool preserveConflictChoices)
+    {
+        Dictionary<string, ConflictChoice> previousChoices = null;
+        if (preserveConflictChoices)
+        {
+            previousChoices = result.Conflicts
+                .GroupBy(ConflictIdentity, StringComparer.Ordinal)
+                .ToDictionary(
+                    group => group.Key,
+                    group => new ConflictChoice(group.Last().Resolution, group.Last().ManualValue ?? ""),
+                    StringComparer.Ordinal);
+        }
+
+        result.Conflicts.Clear();
+        result.Patch.Params.Clear();
+        result.SafeRows = 0;
+        result.SafeFields = 0;
+        result.IdenticalFields = 0;
+
         var mergedRows = new Dictionary<RowKey, MergedRow>();
 
-        foreach (var source in sources)
+        foreach (var source in result.Sources)
         {
             foreach (var paramDelta in source.Delta.Params)
             {
@@ -193,7 +190,8 @@ public sealed class ParamDeltaAutoMergeEngine
                         current = new MergedRow
                         {
                             Row = cloned,
-                            RowSource = source.Filename
+                            RowSource = source.Filename,
+                            NameSource = cloned.Name != null ? source.Filename : ""
                         };
 
                         foreach (var field in cloned.Fields)
@@ -205,7 +203,7 @@ public sealed class ParamDeltaAutoMergeEngine
                         continue;
                     }
 
-                    MergeRow(key, current, incoming, source.Filename, strategy, result);
+                    MergeRow(key, current, incoming, source.Filename, result.Strategy, previousChoices, result);
                 }
             }
         }
@@ -220,8 +218,12 @@ public sealed class ParamDeltaAutoMergeEngine
 
             foreach (var row in paramGroup)
             {
-                if (row.Value.Row.State == RowDeltaState.Modified && row.Value.Row.Fields.Count == 0)
+                if (row.Value.Row.State == RowDeltaState.Modified &&
+                    row.Value.Row.Fields.Count == 0 &&
+                    row.Value.Row.Name == null)
+                {
                     continue;
+                }
 
                 paramDelta.Rows.Add(CloneRow(row.Value.Row));
             }
@@ -230,7 +232,7 @@ public sealed class ParamDeltaAutoMergeEngine
                 result.Patch.Params.Add(paramDelta);
         }
 
-        return result;
+        result.BaselinePatch = ClonePatch(result.Patch);
     }
 
     private void ValidateSources(IReadOnlyList<DeltaImportEntry> sources, ParamDeltaAutoMergeResult result)
@@ -262,14 +264,50 @@ public sealed class ParamDeltaAutoMergeEngine
         RowDelta incoming,
         string incomingSource,
         ParamDeltaConflictStrategy strategy,
+        IReadOnlyDictionary<string, ConflictChoice> previousChoices,
         ParamDeltaAutoMergeResult result)
     {
+        if (current.Row.State == RowDeltaState.Added && incoming.State == RowDeltaState.Added)
+        {
+            if (RowsEquivalent(current.Row, incoming))
+            {
+                result.SafeRows++;
+                result.IdenticalFields += incoming.Fields.Count;
+                return;
+            }
+
+            var conflict = new ParamDeltaMergeConflict
+            {
+                Type = ParamDeltaMergeConflictType.RowState,
+                ParamName = key.ParamName,
+                RowID = key.ID,
+                RowIndex = key.Index,
+                ExistingSource = current.RowSource,
+                IncomingSource = incomingSource,
+                BaseValue = "Missing",
+                ExistingState = RowDeltaState.Added,
+                IncomingState = RowDeltaState.Added,
+                ExistingValue = RowSummary(current.Row),
+                IncomingValue = RowSummary(incoming),
+                Resolution = ResolutionFromStrategy(strategy),
+                ExistingRowSnapshot = CloneRow(current.Row),
+                IncomingRowSnapshot = CloneRow(incoming)
+            };
+            RestoreConflictChoice(conflict, previousChoices);
+            result.Conflicts.Add(conflict);
+
+            if (conflict.Resolution == ParamDeltaConflictResolution.UseLater)
+                ReplaceCurrentRow(current, incoming, incomingSource);
+
+            return;
+        }
+
         if (current.Row.State == RowDeltaState.Deleted || incoming.State == RowDeltaState.Deleted)
         {
             if (current.Row.State == RowDeltaState.Deleted && incoming.State == RowDeltaState.Deleted)
                 return;
 
-            result.Conflicts.Add(new ParamDeltaMergeConflict
+            var conflict = new ParamDeltaMergeConflict
             {
                 Type = ParamDeltaMergeConflictType.RowState,
                 ParamName = key.ParamName,
@@ -280,19 +318,17 @@ public sealed class ParamDeltaAutoMergeEngine
                 BaseValue = VanillaRowExists(key.ParamName, key.ID, key.Index) ? "Exists" : "Missing",
                 ExistingState = current.Row.State,
                 IncomingState = incoming.State,
+                ExistingValue = RowSummary(current.Row),
+                IncomingValue = RowSummary(incoming),
                 Resolution = ResolutionFromStrategy(strategy),
                 ExistingRowSnapshot = CloneRow(current.Row),
                 IncomingRowSnapshot = CloneRow(incoming)
-            });
+            };
+            RestoreConflictChoice(conflict, previousChoices);
+            result.Conflicts.Add(conflict);
 
-            if (strategy == ParamDeltaConflictStrategy.PreferLast)
-            {
-                current.Row = CloneRow(incoming);
-                current.RowSource = incomingSource;
-                current.FieldSources.Clear();
-                foreach (var field in current.Row.Fields)
-                    current.FieldSources[field.Field] = incomingSource;
-            }
+            if (conflict.Resolution == ParamDeltaConflictResolution.UseLater)
+                ReplaceCurrentRow(current, incoming, incomingSource);
 
             return;
         }
@@ -303,8 +339,7 @@ public sealed class ParamDeltaAutoMergeEngine
             ? RowDeltaState.Modified
             : RowDeltaState.Added;
 
-        if (string.IsNullOrWhiteSpace(current.Row.Name) && !string.IsNullOrWhiteSpace(incoming.Name))
-            current.Row.Name = incoming.Name;
+        MergeRowName(key, current, incoming, incomingSource, strategy, previousChoices, result);
 
         foreach (var incomingField in incoming.Fields)
         {
@@ -327,7 +362,7 @@ public sealed class ParamDeltaAutoMergeEngine
                 ? fieldSource
                 : current.RowSource;
 
-            result.Conflicts.Add(new ParamDeltaMergeConflict
+            var conflict = new ParamDeltaMergeConflict
             {
                 Type = ParamDeltaMergeConflictType.FieldValue,
                 ParamName = key.ParamName,
@@ -341,15 +376,108 @@ public sealed class ParamDeltaAutoMergeEngine
                 IncomingValue = incomingField.Value,
                 ExistingState = current.Row.State,
                 IncomingState = incoming.State,
+                ManualValueType = GetVanillaFieldTypeName(key.ParamName, key.ID, key.Index, incomingField.Field),
                 Resolution = ResolutionFromStrategy(strategy)
-            });
+            };
+            RestoreConflictChoice(conflict, previousChoices);
+            conflict.ManualValueValid =
+                conflict.Resolution != ParamDeltaConflictResolution.Manual ||
+                IsValidManualFieldValue(key.ParamName, key.ID, key.Index, incomingField.Field, conflict.ManualValue);
+            result.Conflicts.Add(conflict);
 
-            if (strategy == ParamDeltaConflictStrategy.PreferLast)
+            switch (conflict.Resolution)
             {
-                existingField.Value = incomingField.Value;
-                current.FieldSources[incomingField.Field] = incomingSource;
+                case ParamDeltaConflictResolution.UseLater:
+                    existingField.Value = incomingField.Value;
+                    current.FieldSources[incomingField.Field] = incomingSource;
+                    break;
+                case ParamDeltaConflictResolution.Manual when conflict.ManualValueValid:
+                    existingField.Value = conflict.ManualValue ?? "";
+                    current.FieldSources[incomingField.Field] = "Manual resolution";
+                    break;
             }
         }
+    }
+
+    private void MergeRowName(
+        RowKey key,
+        MergedRow current,
+        RowDelta incoming,
+        string incomingSource,
+        ParamDeltaConflictStrategy strategy,
+        IReadOnlyDictionary<string, ConflictChoice> previousChoices,
+        ParamDeltaAutoMergeResult result)
+    {
+        // Null means this source did not change the vanilla row name. Empty string is a
+        // legitimate explicit rename and must therefore not be treated as missing.
+        if (incoming.Name == null)
+            return;
+
+        if (current.Row.Name == null)
+        {
+            current.Row.Name = incoming.Name;
+            current.NameSource = incomingSource;
+            return;
+        }
+
+        if (string.Equals(current.Row.Name, incoming.Name, StringComparison.Ordinal))
+            return;
+
+        var conflict = new ParamDeltaMergeConflict
+        {
+            Type = ParamDeltaMergeConflictType.RowName,
+            ParamName = key.ParamName,
+            RowID = key.ID,
+            RowIndex = key.Index,
+            ExistingSource = string.IsNullOrWhiteSpace(current.NameSource) ? current.RowSource : current.NameSource,
+            IncomingSource = incomingSource,
+            BaseValue = GetVanillaRow(key.ParamName, key.ID, key.Index)?.Name ?? "",
+            ExistingValue = current.Row.Name ?? "",
+            IncomingValue = incoming.Name ?? "",
+            ExistingState = current.Row.State,
+            IncomingState = incoming.State,
+            Resolution = ResolutionFromStrategy(strategy)
+        };
+        RestoreConflictChoice(conflict, previousChoices);
+        result.Conflicts.Add(conflict);
+
+        switch (conflict.Resolution)
+        {
+            case ParamDeltaConflictResolution.UseLater:
+                current.Row.Name = incoming.Name;
+                current.NameSource = incomingSource;
+                break;
+            case ParamDeltaConflictResolution.Manual:
+                current.Row.Name = conflict.ManualValue ?? "";
+                current.NameSource = "Manual resolution";
+                break;
+        }
+    }
+
+    private static void ReplaceCurrentRow(MergedRow current, RowDelta incoming, string incomingSource)
+    {
+        current.Row = CloneRow(incoming);
+        current.RowSource = incomingSource;
+        current.NameSource = incoming.Name != null ? incomingSource : "";
+        current.FieldSources.Clear();
+        foreach (var field in current.Row.Fields)
+            current.FieldSources[field.Field] = incomingSource;
+    }
+
+    private static void RestoreConflictChoice(
+        ParamDeltaMergeConflict conflict,
+        IReadOnlyDictionary<string, ConflictChoice> previousChoices)
+    {
+        if (previousChoices == null || !previousChoices.TryGetValue(ConflictIdentity(conflict), out var choice))
+            return;
+
+        conflict.Resolution = choice.Resolution;
+        conflict.ManualValue = choice.ManualValue ?? "";
+    }
+
+    private static string ConflictIdentity(ParamDeltaMergeConflict conflict)
+    {
+        return $"{conflict.Type}|{conflict.ParamName}|{conflict.RowID}|{conflict.RowIndex}|{conflict.Field}|{conflict.IncomingSource}";
     }
 
     private RowDelta NormalizeRow(string paramName, RowDelta source)
@@ -370,6 +498,11 @@ public sealed class ParamDeltaAutoMergeEngine
         }
 
         normalized.State = RowDeltaState.Modified;
+
+        // Null means "no row-name change". Preserve an explicit empty string so a source
+        // can intentionally clear a row name.
+        if (source.Name == null || string.Equals(source.Name, vanillaRow.Name, StringComparison.Ordinal))
+            normalized.Name = null;
 
         // A full-row delta (Selected/All export) may label an existing vanilla row as Added.
         // Remove values that are identical to vanilla so they do not create false conflicts.
@@ -400,6 +533,60 @@ public sealed class ParamDeltaAutoMergeEngine
         return string.Equals(vanillaValue, field.Value, StringComparison.Ordinal);
     }
 
+    private string GetVanillaFieldTypeName(string paramName, int id, int index, string fieldName)
+    {
+        var vanillaRow = GetVanillaRow(paramName, id, index);
+        var column = vanillaRow?.Columns.FirstOrDefault(e => e.Def.InternalName == fieldName);
+        return column?.Def.DisplayType.ToString() ?? "Unknown";
+    }
+
+    private bool IsValidManualFieldValue(string paramName, int id, int index, string fieldName, string value)
+    {
+        var vanillaRow = GetVanillaRow(paramName, id, index);
+        var column = vanillaRow?.Columns.FirstOrDefault(e => e.Def.InternalName == fieldName);
+        if (column == null)
+            return false;
+
+        switch (column.Def.DisplayType)
+        {
+            case PARAMDEF.DefType.s8:
+                return sbyte.TryParse(value, out _);
+            case PARAMDEF.DefType.s16:
+                return short.TryParse(value, out _);
+            case PARAMDEF.DefType.s32:
+            case PARAMDEF.DefType.b32:
+                return int.TryParse(value, out _);
+            case PARAMDEF.DefType.f32:
+            case PARAMDEF.DefType.angle32:
+                return float.TryParse(value, out _);
+            case PARAMDEF.DefType.f64:
+                return double.TryParse(value, out _);
+            case PARAMDEF.DefType.u8:
+                return byte.TryParse(value, out _);
+            case PARAMDEF.DefType.dummy8:
+                if (column.Def.ArrayLength <= 1)
+                    return byte.TryParse(value, out _);
+
+                try
+                {
+                    return ParamUtils.Dummy8Read(value, column.Def.ArrayLength)?.Length == column.Def.ArrayLength;
+                }
+                catch
+                {
+                    return false;
+                }
+            case PARAMDEF.DefType.u16:
+                return ushort.TryParse(value, out _);
+            case PARAMDEF.DefType.u32:
+                return uint.TryParse(value, out _);
+            case PARAMDEF.DefType.fixstr:
+            case PARAMDEF.DefType.fixstrW:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private string GetVanillaFieldValue(string paramName, int id, int index, string fieldName)
     {
         var vanillaRow = GetVanillaRow(paramName, id, index);
@@ -428,23 +615,87 @@ public sealed class ParamDeltaAutoMergeEngine
         if (!vanillaBank.Params.TryGetValue(paramName, out var vanillaParam))
             return null;
 
-        var currentRowID = 0;
-        var internalIndex = 0;
-
+        var occurrence = 0;
         foreach (var row in vanillaParam.Rows)
         {
-            if (row.ID == currentRowID)
-                internalIndex++;
-            else
-                internalIndex = 0;
+            if (row.ID != id)
+                continue;
 
-            if (row.ID == id && internalIndex == index)
+            if (occurrence == index)
                 return row;
 
-            currentRowID = row.ID;
+            occurrence++;
         }
 
         return null;
+    }
+
+    private static bool RowsEquivalent(RowDelta left, RowDelta right)
+    {
+        if (left.ID != right.ID || left.Index != right.Index || left.State != right.State ||
+            !string.Equals(left.Name ?? "", right.Name ?? "", StringComparison.Ordinal))
+            return false;
+
+        if (left.Fields.Count != right.Fields.Count)
+            return false;
+
+        var leftFields = left.Fields
+            .GroupBy(e => e.Field, StringComparer.Ordinal)
+            .ToDictionary(e => e.Key, e => e.Last().Value ?? "", StringComparer.Ordinal);
+        var rightFields = right.Fields
+            .GroupBy(e => e.Field, StringComparer.Ordinal)
+            .ToDictionary(e => e.Key, e => e.Last().Value ?? "", StringComparer.Ordinal);
+
+        return leftFields.Count == rightFields.Count &&
+               leftFields.All(pair => rightFields.TryGetValue(pair.Key, out var value) &&
+                                      string.Equals(pair.Value, value, StringComparison.Ordinal));
+    }
+
+    private static string RowSummary(RowDelta row)
+    {
+        var parts = new List<string>();
+        if (row.Name != null)
+            parts.Add($"Name={row.Name}");
+
+        parts.AddRange(row.Fields
+            .OrderBy(e => e.Field, StringComparer.Ordinal)
+            .Take(4)
+            .Select(e => $"{e.Field}={e.Value}"));
+
+        var suffix = row.Fields.Count > 4 ? $" (+{row.Fields.Count - 4} more)" : "";
+        return string.Join(", ", parts) + suffix;
+    }
+
+    private static ParamDeltaPatch ClonePatch(ParamDeltaPatch patch)
+    {
+        var clone = new ParamDeltaPatch
+        {
+            ProjectType = patch.ProjectType,
+            ParamVersion = patch.ParamVersion,
+            Tag = patch.Tag
+        };
+
+        foreach (var param in patch.Params)
+        {
+            var paramClone = new ParamDelta { Name = param.Name };
+            foreach (var row in param.Rows)
+                paramClone.Rows.Add(CloneRow(row));
+            clone.Params.Add(paramClone);
+        }
+
+        return clone;
+    }
+
+    private static void ResetPatch(ParamDeltaPatch target, ParamDeltaPatch baseline)
+    {
+        target.Params.Clear();
+        foreach (var param in baseline.Params)
+        {
+            var paramClone = new ParamDelta { Name = param.Name };
+            foreach (var row in param.Rows)
+                paramClone.Rows.Add(CloneRow(row));
+            target.Params.Add(paramClone);
+        }
     }
 
     private static RowDelta CloneRow(RowDelta row)
@@ -489,6 +740,7 @@ public sealed class ParamDeltaAutoMergeTool
     private FullModMergeAnalysis LastFullModAnalysis;
     private ParamDeltaConflictStrategy Strategy = ParamDeltaConflictStrategy.StopOnConflict;
     private string OutputName = "auto_merged";
+    private string RegulationDeltaOutputName = "auto_merged_regulation";
     private string RegulationOutputPath = "";
     private string RegulationBuildStatus = "";
     private string FullModOutputPath = "";
@@ -546,6 +798,7 @@ public sealed class ParamDeltaAutoMergeTool
         GUI.SimpleHeader(
             LOC.Get("PARAM_AutoMerge_Delta_Merge_Source_List_Header"),
             LOC.Get("PARAM_AutoMerge_Delta_Merge_Source_List_Header_TT"));
+        GUI.WrappedText(LOC.Get("PARAM_AutoMerge_Source_Priority_Hint"));
 
         // Select All
         if (ImGui.Button($"{Icons.Bars}##selectAllAction", DPI.IconButtonSize))
@@ -587,7 +840,8 @@ public sealed class ParamDeltaAutoMergeTool
         // List
         ImGui.BeginChild("autoMergeSourceList", new System.Numerics.Vector2(0, 180), ImGuiChildFlags.Borders);
 
-        SyncSelectedFileOrder();
+        if (SyncSelectedFileOrder())
+            LastResult = null;
         var displayEntries = Patcher.Selection.ImportList
             .OrderBy(e =>
             {
@@ -634,6 +888,7 @@ public sealed class ParamDeltaAutoMergeTool
                         (SelectedFileOrder[priority], SelectedFileOrder[priority - 1]);
                     LastResult = null;
                 }
+                GUI.Tooltip(LOC.Get("PARAM_AutoMerge_Source_Move_Earlier_TT"));
 
                 ImGui.SameLine();
                 if (ImGui.SmallButton($"↓##autoMergeDeltaSourceDown{entry.Filename.GetHashCode()}") && priority >= 0 && priority + 1 < SelectedFileOrder.Count)
@@ -642,6 +897,7 @@ public sealed class ParamDeltaAutoMergeTool
                         (SelectedFileOrder[priority], SelectedFileOrder[priority + 1]);
                     LastResult = null;
                 }
+                GUI.Tooltip(LOC.Get("PARAM_AutoMerge_Source_Move_Later_TT"));
             }
         }
 
@@ -693,6 +949,9 @@ public sealed class ParamDeltaAutoMergeTool
     private void SaveMergedDelta()
     {
         Engine.ApplyConflictResolutions(LastResult);
+        if (!LastResult.CanApply)
+            return;
+
         var name = string.IsNullOrWhiteSpace(OutputName) ? "auto_merged" : OutputName.Trim();
         Patcher.WriteDeltaPatch(LastResult.Patch, name);
         Patcher.Selection.RefreshImportList();
@@ -701,8 +960,150 @@ public sealed class ParamDeltaAutoMergeTool
     private void ImportMergedDelta()
     {
         Engine.ApplyConflictResolutions(LastResult);
+        if (!LastResult.CanApply)
+            return;
+
         var name = string.IsNullOrWhiteSpace(OutputName) ? "auto_merged" : OutputName.Trim();
-        Patcher.Importer.ImportDelta(name, LastResult.Patch);
+        ImportMergedPatchLocally(name, LastResult.Patch);
+    }
+
+    // Auto Merge needs two import behaviors that the shared Delta Patcher importer does not
+    // currently provide: preserving explicit row-name changes and matching the first row whose
+    // ID is 0 at duplicate index 0. Keep those behaviors local to Auto Merge so the existing
+    // Smithbox Delta Patcher implementation remains completely unchanged.
+    private void ImportMergedPatchLocally(string filename, ParamDeltaPatch patch)
+    {
+        try
+        {
+            var primaryBank = Patcher.Project.Handler.ParamData.PrimaryBank;
+            var vanillaBank = Patcher.Project.Handler.ParamData.VanillaBank;
+
+            foreach (var curParam in primaryBank.Params)
+            {
+                var pDelta = patch.Params.FirstOrDefault(e => e.Name == curParam.Key);
+                if (pDelta == null)
+                    continue;
+
+                var param = curParam.Value;
+                var srcRow = param.Rows.FirstOrDefault();
+                if (srcRow == null)
+                    continue;
+
+                var vanillaParam = vanillaBank.Params.FirstOrDefault(e => e.Key == curParam.Key);
+                foreach (var rowDelta in pDelta.Rows)
+                    HandleMergedRowImport(curParam.Key, param, vanillaParam.Value, srcRow, rowDelta);
+            }
+
+            primaryBank.RefreshPrimaryDiffCaches(true);
+            Smithbox.Log(this, LOC.Get("PARAM_DeltaPatcher_Importer_Finished_Import", filename));
+        }
+        catch (Exception ex)
+        {
+            Smithbox.LogError(this, LOC.Get("PARAM_DeltaPatcher_Importer_Failed_Import", filename), ex);
+        }
+    }
+
+    private void HandleMergedRowImport(string paramName, Param srcParam, Param vanillaParam, Param.Row srcRow, RowDelta rowDelta)
+    {
+        var addRows = CFG.Current.ParamEditor_DeltaPatcher_Import_Added_Rows;
+        var modRows = CFG.Current.ParamEditor_DeltaPatcher_Import_Modified_Rows;
+        var delRows = CFG.Current.ParamEditor_DeltaPatcher_Import_Deleted_Rows;
+        var restrictRowAdd = CFG.Current.ParamEditor_DeltaPatcher_Import_Restrict_Row_Add;
+        var restrictRowMod = CFG.Current.ParamEditor_DeltaPatcher_Import_Restrict_Row_Modify;
+
+        HashSet<Param.Row> vanillaDiffCache =
+            Patcher.Project.Handler.ParamData.PrimaryBank.GetVanillaDiffRows(paramName);
+
+        var rowStateIsAdded = rowDelta.State is RowDeltaState.Added;
+        if (Patcher.ImportMode is DeltaImportMode.Simple)
+            rowStateIsAdded = true;
+
+        if (addRows && rowStateIsAdded)
+        {
+            var newRow = new Param.Row(srcRow)
+            {
+                ID = rowDelta.ID
+            };
+
+            if (rowDelta.Name != null)
+                newRow.Name = rowDelta.Name;
+
+            Patcher.Importer.HandleFieldImport(newRow, rowDelta);
+
+            if (CFG.Current.ParamEditor_DeltaPatcher_Import_Allow_Row_Overwrite)
+            {
+                var matchRow = srcParam.Rows.FirstOrDefault(e => e.ID == rowDelta.ID);
+                if (matchRow != null)
+                {
+                    var insertIndex = srcParam.Rows.ToList().IndexOf(matchRow);
+                    srcParam.InsertRow(insertIndex, newRow);
+                    srcParam.RemoveRow(matchRow);
+                }
+                else
+                {
+                    srcParam.AddRow(newRow);
+                }
+            }
+            else
+            {
+                var insertRow = srcParam.Rows.FirstOrDefault(e => e.ID == rowDelta.ID);
+                if (insertRow != null)
+                {
+                    if (!restrictRowAdd)
+                    {
+                        var insertIndex = srcParam.Rows.ToList().IndexOf(insertRow);
+                        srcParam.InsertRow(insertIndex, newRow);
+                    }
+                }
+                else
+                {
+                    srcParam.AddRow(newRow);
+                }
+            }
+
+            return;
+        }
+
+        if (rowDelta.State is not (RowDeltaState.Deleted or RowDeltaState.Modified))
+            return;
+
+        var curRowID = 0;
+        var hasCurRowID = false;
+        var internalIndex = 0;
+        Param.Row rowToDelete = null;
+
+        foreach (var row in srcParam.Rows)
+        {
+            if (hasCurRowID && row.ID == curRowID)
+                internalIndex++;
+            else
+                internalIndex = 0;
+
+            if (rowDelta.ID == row.ID && rowDelta.Index == internalIndex)
+            {
+                if (modRows && rowDelta.State is RowDeltaState.Modified)
+                {
+                    var proceed = !(restrictRowMod && vanillaDiffCache.Contains(row));
+                    if (proceed)
+                    {
+                        if (rowDelta.Name != null)
+                            row.Name = rowDelta.Name;
+
+                        Patcher.Importer.HandleFieldImport(row, rowDelta);
+                    }
+                }
+                else if (delRows && rowDelta.State is RowDeltaState.Deleted)
+                {
+                    rowToDelete = row;
+                }
+            }
+
+            curRowID = row.ID;
+            hasCurRowID = true;
+        }
+
+        if (rowToDelete != null)
+            srcParam.RemoveRow(rowToDelete);
     }
 
     public void DisplayDirectRegulationMerge()
@@ -728,15 +1129,19 @@ public sealed class ParamDeltaAutoMergeTool
             RegulationMerge.AutoUpgradeMismatchedVersions = autoUpgradeRegulation;
             LastRegulationAnalysis = null;
         }
+        GUI.Tooltip(LOC.Get("PARAM_DirectMerge_Apply_ParamVer_AutoUpgrade_TT"));
+        if (autoUpgradeRegulation)
+            GUI.WrappedText(LOC.Get("PARAM_AutoMerge_AutoUpgrade_Warning"));
 
         // Sources
         GUI.Spacer();
         GUI.SimpleHeader(
             LOC.Get("PARAM_DirectMerge_Sources_Header"),
             LOC.Get("PARAM_DirectMerge_Sources_Header_TT"));
+        GUI.WrappedText(LOC.Get("PARAM_AutoMerge_Source_Priority_Hint"));
 
         // Add
-        if (ImGui.Button($"{Icons.Plus}##addEntryAction", DPI.IconButtonSize))
+        if (ImGui.Button($"{Icons.Plus}##addRegulationSourceAction", DPI.IconButtonSize))
         {
             RegulationPaths.Add("");
             LastRegulationAnalysis = null;
@@ -746,11 +1151,11 @@ public sealed class ParamDeltaAutoMergeTool
         ImGui.SameLine();
 
         // Remove
-        if (RegulationPaths.Count < 2)
+        if (RegulationPaths.Count <= 2)
         {
             ImGui.BeginDisabled();
 
-            if (ImGui.Button($"{Icons.Minus}##removeEntryAction", DPI.IconButtonSize))
+            if (ImGui.Button($"{Icons.Minus}##removeRegulationSourceAction", DPI.IconButtonSize))
             {
             }
             GUI.Tooltip(LOC.Get("PARAM_DirectMerge_Remove_Regulation_Source_TT"));
@@ -759,7 +1164,7 @@ public sealed class ParamDeltaAutoMergeTool
         }
         else
         {
-            if (ImGui.Button($"{Icons.Minus}##mapSelectionRemove", DPI.IconButtonSize))
+            if (ImGui.Button($"{Icons.Minus}##removeLastRegulationSourceAction", DPI.IconButtonSize))
             {
                 RegulationPaths.RemoveAt(RegulationPaths.Count - 1);
                 LastRegulationAnalysis = null;
@@ -770,7 +1175,7 @@ public sealed class ParamDeltaAutoMergeTool
         ImGui.SameLine();
 
         // Reset
-        if (ImGui.Button($"{LOC.Get("PARAM_DirectMerge_Reset_Source_List")}##resetEntryList", DPI.SelectorButtonSize))
+        if (ImGui.Button($"{LOC.Get("PARAM_DirectMerge_Reset_Source_List")}##resetRegulationSourceList", DPI.SelectorButtonSize))
         {
             for (var i = 0; i < RegulationPaths.Count; i++)
                 RegulationPaths[i] = "";
@@ -805,6 +1210,7 @@ public sealed class ParamDeltaAutoMergeTool
                 LastRegulationAnalysis = null;
                 RegulationBuildStatus = "";
             }
+            GUI.Tooltip(LOC.Get("PARAM_AutoMerge_Source_Move_Earlier_TT"));
 
             ImGui.SameLine();
 
@@ -814,6 +1220,17 @@ public sealed class ParamDeltaAutoMergeTool
                 LastRegulationAnalysis = null;
                 RegulationBuildStatus = "";
             }
+            GUI.Tooltip(LOC.Get("PARAM_AutoMerge_Source_Move_Later_TT"));
+
+            ImGui.SameLine();
+            if (RegulationPaths.Count > 2 && ImGui.SmallButton($"×##autoMergeRegSourceRemove{i}"))
+            {
+                RegulationPaths.RemoveAt(i);
+                LastRegulationAnalysis = null;
+                RegulationBuildStatus = "";
+                break;
+            }
+            GUI.Tooltip(LOC.Get("PARAM_AutoMerge_Source_Remove_TT"));
 
             ImGui.SameLine();
 
@@ -911,7 +1328,10 @@ public sealed class ParamDeltaAutoMergeTool
         // Output Path
         if (ImGui.Button($"{LOC.Get("PARAM_DirectMerge_Select_Path")}##selectOutputPath", DPI.SelectorButtonSize))
         {
-            var dialog = PlatformUtils.Instance.OpenFileDialog(LOC.Get("PARAM_DirectMerge_Select_Regulation"), out var path);
+            var filters = Patcher.Project.Descriptor.ProjectType == ProjectType.DS3
+                ? new[] { FilterStrings.Data0Filter }
+                : new[] { FilterStrings.RegulationBinFilter };
+            var dialog = PlatformUtils.Instance.SaveFileDialog("Save Merged Regulation", filters, out var path);
 
             if (dialog)
             {
@@ -925,6 +1345,11 @@ public sealed class ParamDeltaAutoMergeTool
             $"{LOC.Get("PARAM_DirectMerge_OutputPath")}##autoMergeRegOutput", 
             LOC.Get("PARAM_DirectMerge_OutputPath_Hint"),
             ref RegulationOutputPath, 1024);
+
+        ImGui.InputTextWithHint(
+            $"{"Merged Delta Filename"}##autoMergeRegDeltaOutput",
+            "Enter a filename for Save Merged Delta...",
+            ref RegulationDeltaOutputName, 255);
 
         GUI.Spacer();
 
@@ -954,14 +1379,28 @@ public sealed class ParamDeltaAutoMergeTool
     private void ImportMergedRegulationChanges()
     {
         Engine.ApplyConflictResolutions(LastRegulationAnalysis.MergeResult);
-        Patcher.Importer.ImportDelta("direct_regulation_auto_merge", LastRegulationAnalysis.MergeResult.Patch);
+        if (!LastRegulationAnalysis.MergeResult.CanApply)
+        {
+            RegulationBuildStatus = LOC.Get("PARAM_AutoMerge_ConflictEditor_Cannot_Apply_Hint");
+            return;
+        }
+
+        ImportMergedPatchLocally("direct_regulation_auto_merge", LastRegulationAnalysis.MergeResult.Patch);
         RegulationBuildStatus = LOC.Get("PARAM_DirectMerge_Imported_Merged_Changes");
     }
 
     private void SaveMergedRegulationChanges()
     {
         Engine.ApplyConflictResolutions(LastRegulationAnalysis.MergeResult);
-        var name = string.IsNullOrWhiteSpace(OutputName) ? "auto_merged" : OutputName.Trim();
+        if (!LastRegulationAnalysis.MergeResult.CanApply)
+        {
+            RegulationBuildStatus = LOC.Get("PARAM_AutoMerge_ConflictEditor_Cannot_Apply_Hint");
+            return;
+        }
+
+        var name = string.IsNullOrWhiteSpace(RegulationDeltaOutputName)
+            ? "auto_merged_regulation"
+            : RegulationDeltaOutputName.Trim();
         Patcher.WriteDeltaPatch(LastRegulationAnalysis.MergeResult.Patch, name);
         Patcher.Selection.RefreshImportList();
         RegulationBuildStatus = LOC.Get("PARAM_DirectMerge_Saved_Merged_Changes", name);
@@ -990,6 +1429,8 @@ public sealed class ParamDeltaAutoMergeTool
             LastFullModAnalysis = null;
         }
         GUI.Tooltip(LOC.Get("PARAM_ProjectMerge_AutoUpgrade_Regulation_TT"));
+        if (autoUpgradeRegulation)
+            GUI.WrappedText(LOC.Get("PARAM_AutoMerge_AutoUpgrade_Warning"));
 
         // Ignore Metadata Files
         if (ImGui.Checkbox($"{LOC.Get("PARAM_ProjectMerge_Merge_Metadata")}##autoMergeFullMetadata", ref FullModIgnoreMetadata))
@@ -1007,10 +1448,11 @@ public sealed class ParamDeltaAutoMergeTool
         GUI.SimpleHeader(
             LOC.Get("PARAM_ProjectMerge_Sources_Header"),
             LOC.Get("PARAM_ProjectMerge_Sources_Header_TT"));
+        GUI.WrappedText(LOC.Get("PARAM_AutoMerge_Source_Priority_Hint"));
 
 
         // Add
-        if (ImGui.Button($"{Icons.Plus}##addEntryAction", DPI.IconButtonSize))
+        if (ImGui.Button($"{Icons.Plus}##addProjectSourceAction", DPI.IconButtonSize))
         {
             FullModFolderPaths.Add("");
             LastFullModAnalysis = null;
@@ -1020,11 +1462,11 @@ public sealed class ParamDeltaAutoMergeTool
         ImGui.SameLine();
 
         // Remove
-        if (FullModFolderPaths.Count < 2)
+        if (FullModFolderPaths.Count <= 2)
         {
             ImGui.BeginDisabled();
 
-            if (ImGui.Button($"{Icons.Minus}##removeEntryAction", DPI.IconButtonSize))
+            if (ImGui.Button($"{Icons.Minus}##removeProjectSourceAction", DPI.IconButtonSize))
             {
             }
             GUI.Tooltip(LOC.Get("PARAM_ProjectMerge_Remove_Project_Source_TT"));
@@ -1033,7 +1475,7 @@ public sealed class ParamDeltaAutoMergeTool
         }
         else
         {
-            if (ImGui.Button($"{Icons.Minus}##mapSelectionRemove", DPI.IconButtonSize))
+            if (ImGui.Button($"{Icons.Minus}##removeLastProjectSourceAction", DPI.IconButtonSize))
             {
                 FullModFolderPaths.RemoveAt(FullModFolderPaths.Count - 1);
                 LastFullModAnalysis = null;
@@ -1044,7 +1486,7 @@ public sealed class ParamDeltaAutoMergeTool
         ImGui.SameLine();
 
         // Reset
-        if (ImGui.Button($"{LOC.Get("PARAM_ProjectMerge_Reset_Source_List")}##resetEntryList", DPI.SelectorButtonSize))
+        if (ImGui.Button($"{LOC.Get("PARAM_ProjectMerge_Reset_Source_List")}##resetProjectSourceList", DPI.SelectorButtonSize))
         {
             for (var i = 0; i < FullModFolderPaths.Count; i++)
             {
@@ -1081,6 +1523,7 @@ public sealed class ParamDeltaAutoMergeTool
                 LastFullModAnalysis = null;
                 FullModBuildStatus = "";
             }
+            GUI.Tooltip(LOC.Get("PARAM_AutoMerge_Source_Move_Earlier_TT"));
 
             ImGui.SameLine();
 
@@ -1090,6 +1533,17 @@ public sealed class ParamDeltaAutoMergeTool
                 LastFullModAnalysis = null;
                 FullModBuildStatus = "";
             }
+            GUI.Tooltip(LOC.Get("PARAM_AutoMerge_Source_Move_Later_TT"));
+
+            ImGui.SameLine();
+            if (FullModFolderPaths.Count > 2 && ImGui.SmallButton($"×##autoMergeProjectSourceRemove{i}"))
+            {
+                FullModFolderPaths.RemoveAt(i);
+                LastFullModAnalysis = null;
+                FullModBuildStatus = "";
+                break;
+            }
+            GUI.Tooltip(LOC.Get("PARAM_AutoMerge_Source_Remove_TT"));
 
             ImGui.SameLine();
 
@@ -1166,7 +1620,9 @@ public sealed class ParamDeltaAutoMergeTool
             ImGui.Text($"{LOC.Get("PARAM_ProjectMerge_Binder_Files_to_Merge", LastFullModAnalysis.BinderFiles)}");
             ImGui.Text($"{LOC.Get("PARAM_ProjectMerge_Regulation_Merges", LastFullModAnalysis.RegulationFiles)}");
             ImGui.Text($"{LOC.Get("PARAM_ProjectMerge_Ignored_Metadata_Files", LastFullModAnalysis.IgnoredFiles)}");
-            ImGui.Text($"{LOC.Get("PARAM_ProjectMerge_Conflicts", LastFullModAnalysis.Conflicts.Count)}");
+            var nonRegulationConflictCount = LastFullModAnalysis.Conflicts.Count(e => e.Type != FullModMergeConflictType.Regulation);
+            var regulationConflictCount = LastFullModAnalysis.RegulationAnalysis?.MergeResult?.Conflicts.Count ?? 0;
+            ImGui.Text($"{LOC.Get("PARAM_ProjectMerge_Conflicts", nonRegulationConflictCount + regulationConflictCount)}");
         }
 
         if (LastFullModAnalysis.Files.Any(e => e.Action == FullModMergeAction.BinderMerge))
@@ -1274,24 +1730,28 @@ public sealed class ParamDeltaAutoMergeTool
                 ref FullModConflictFilter, 512);
 
             // Visible -> Earlier
-            if (ImGui.Button($"{LOC.Get("PARAM_AutoMerge_ConflictEditor_Visible_Earlier")}##autoMergeFullResolveEarlier"))
+            if (ImGui.Button($"{LOC.Get("PARAM_AutoMerge_ConflictEditor_Visible_Earlier")} ({FilterFullModConflicts(analysis).Count()})##autoMergeFullResolveEarlier"))
             {
                 foreach (var conflict in FilterFullModConflicts(analysis))
                 {
                     conflict.Resolution = FullModConflictResolution.UseEarlier;
                 }
+                FullModMerge.RefreshResolvedBinderConflicts(analysis);
             }
+            GUI.Tooltip(LOC.Get("PARAM_AutoMerge_ConflictEditor_Bulk_Filtered_TT"));
 
             ImGui.SameLine();
 
             // Visible -> Later
-            if (ImGui.Button($"{LOC.Get("PARAM_AutoMerge_ConflictEditor_Visible_Later")}##autoMergeFullResolveLater"))
+            if (ImGui.Button($"{LOC.Get("PARAM_AutoMerge_ConflictEditor_Visible_Later")} ({FilterFullModConflicts(analysis).Count()})##autoMergeFullResolveLater"))
             {
                 foreach (var conflict in FilterFullModConflicts(analysis))
                 {
                     conflict.Resolution = FullModConflictResolution.UseLater;
                 }
+                FullModMerge.RefreshResolvedBinderConflicts(analysis);
             }
+            GUI.Tooltip(LOC.Get("PARAM_AutoMerge_ConflictEditor_Bulk_Filtered_TT"));
 
             ImGui.SameLine();
 
@@ -1302,7 +1762,9 @@ public sealed class ParamDeltaAutoMergeTool
                 {
                     conflict.Resolution = FullModConflictResolution.Unresolved;
                 }
+                FullModMerge.RefreshResolvedBinderConflicts(analysis);
             }
+            GUI.Tooltip(LOC.Get("PARAM_AutoMerge_ConflictEditor_Bulk_Filtered_TT"));
 
             var filtered = FilterFullModConflicts(analysis).ToList();
             var pageCount = Math.Max(1, (filtered.Count + ConflictRowsPerPage - 1) / ConflictRowsPerPage);
@@ -1377,6 +1839,12 @@ public sealed class ParamDeltaAutoMergeTool
                                         ? conflict.CandidateSources.FirstOrDefault() ?? ""
                                         : conflict.ExistingValue;
                                 }
+
+                                if ((conflict.Type is FullModMergeConflictType.BinderEntry or FullModMergeConflictType.MatbinValue) &&
+                                    conflict.IsManualValueValid)
+                                {
+                                    FullModMerge.RefreshResolvedBinderConflicts(analysis);
+                                }
                             }
                         }
                         ImGui.EndCombo();
@@ -1407,7 +1875,18 @@ public sealed class ParamDeltaAutoMergeTool
                         {
                             var manual = conflict.ManualValue ?? "";
                             if (ImGui.InputText($"##fullConflictManual{index}", ref manual, 1024))
+                            {
                                 conflict.ManualValue = manual;
+                                if (conflict.IsManualValueValid)
+                                    FullModMerge.RefreshResolvedBinderConflicts(analysis);
+                            }
+
+                            if (!conflict.IsManualValueValid)
+                            {
+                                GUI.WrappedText(LOC.Get(
+                                    "PARAM_AutoMerge_Manual_Value_Invalid",
+                                    conflict.ValueKind.ToString()));
+                            }
                         }
                     }
                     else
@@ -1492,7 +1971,10 @@ public sealed class ParamDeltaAutoMergeTool
         {
             var firstPath = LastRegulationAnalysis.Sources[0].Path;
             var directory = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(firstPath));
-            RegulationOutputPath = System.IO.Path.Combine(directory ?? "", "merged_regulation.bin");
+            var outputFileName = Patcher.Project.Descriptor.ProjectType == ProjectType.DS3
+                ? "merged_Data0.bdt"
+                : "merged_regulation.bin";
+            RegulationOutputPath = System.IO.Path.Combine(directory ?? "", outputFileName);
         }
     }
 
@@ -1526,8 +2008,10 @@ public sealed class ParamDeltaAutoMergeTool
         LastResult = Engine.Merge(sources, Strategy);
     }
 
-    private void SyncSelectedFileOrder()
+    private bool SyncSelectedFileOrder()
     {
+        var beforeFiles = SelectedFiles.Count;
+        var beforeOrder = string.Join("\n", SelectedFileOrder);
         var available = new HashSet<string>(
             Patcher.Selection.ImportList.Select(e => e.Filename),
             StringComparer.OrdinalIgnoreCase);
@@ -1540,6 +2024,9 @@ public sealed class ParamDeltaAutoMergeTool
             if (SelectedFiles.Contains(entry.Filename) && GetSelectedFileOrderIndex(entry.Filename) < 0)
                 SelectedFileOrder.Add(entry.Filename);
         }
+
+        return beforeFiles != SelectedFiles.Count ||
+               !string.Equals(beforeOrder, string.Join("\n", SelectedFileOrder), StringComparison.Ordinal);
     }
 
     private int GetSelectedFileOrderIndex(string filename)
@@ -1589,7 +2076,7 @@ public sealed class ParamDeltaAutoMergeTool
                     conflict.ExistingSource.Contains(ParamConflictFilter, StringComparison.OrdinalIgnoreCase) ||
                     conflict.IncomingSource.Contains(ParamConflictFilter, StringComparison.OrdinalIgnoreCase)).ToList();
 
-                if (ImGui.Button($"{LOC.Get("PARAM_AutoMerge_ConflictEditor_Visible_Earlier")}##paramResolveEarlier_{idSuffix}"))
+                if (ImGui.Button($"{LOC.Get("PARAM_AutoMerge_ConflictEditor_Visible_Earlier")} ({filtered.Count})##paramResolveEarlier_{idSuffix}"))
                 {
                     foreach (var conflict in filtered)
                     {
@@ -1598,9 +2085,10 @@ public sealed class ParamDeltaAutoMergeTool
 
                     Engine.ApplyConflictResolutions(result);
                 }
+                GUI.Tooltip(LOC.Get("PARAM_AutoMerge_ConflictEditor_Bulk_Filtered_TT"));
 
                 ImGui.SameLine();
-                if (ImGui.Button($"{LOC.Get("PARAM_AutoMerge_ConflictEditor_Visible_Later")}##paramResolveLater_{idSuffix}"))
+                if (ImGui.Button($"{LOC.Get("PARAM_AutoMerge_ConflictEditor_Visible_Later")} ({filtered.Count})##paramResolveLater_{idSuffix}"))
                 {
                     foreach (var conflict in filtered)
                     {
@@ -1609,6 +2097,7 @@ public sealed class ParamDeltaAutoMergeTool
 
                     Engine.ApplyConflictResolutions(result);
                 }
+                GUI.Tooltip(LOC.Get("PARAM_AutoMerge_ConflictEditor_Bulk_Filtered_TT"));
 
                 ImGui.SameLine();
                 if (ImGui.Button($"{LOC.Get("PARAM_AutoMerge_ConflictEditor_Visible_Reset")}##paramResolveReset_{idSuffix}"))
@@ -1618,6 +2107,7 @@ public sealed class ParamDeltaAutoMergeTool
                         conflict.Resolution = ParamDeltaConflictResolution.Unresolved;
                     }
                 }
+                GUI.Tooltip(LOC.Get("PARAM_AutoMerge_ConflictEditor_Bulk_Filtered_TT"));
 
                 var pageCount = Math.Max(1, (filtered.Count + ConflictRowsPerPage - 1) / ConflictRowsPerPage);
                 ParamConflictPage = Math.Clamp(ParamConflictPage, 0, pageCount - 1);
@@ -1657,22 +2147,27 @@ public sealed class ParamDeltaAutoMergeTool
                     {
                         ImGui.TableNextRow();
                         ImGui.TableSetColumnIndex(0);
-                        GUI.WrappedText(conflict.Type == ParamDeltaMergeConflictType.FieldValue
-                            ? $"{conflict.ParamName} / {conflict.RowID}:{conflict.RowIndex} / {conflict.Field}"
-                            : $"{conflict.ParamName} / {conflict.RowID}:{conflict.RowIndex}");
+                        GUI.WrappedText(conflict.Type switch
+                        {
+                            ParamDeltaMergeConflictType.FieldValue => $"{conflict.ParamName} / {conflict.RowID}:{conflict.RowIndex} / {conflict.Field}",
+                            ParamDeltaMergeConflictType.RowName => $"{conflict.ParamName} / {conflict.RowID}:{conflict.RowIndex} / {"Row name"}",
+                            _ => $"{conflict.ParamName} / {conflict.RowID}:{conflict.RowIndex}"
+                        });
 
                         ImGui.TableSetColumnIndex(1);
                         GUI.WrappedText(conflict.BaseValue);
 
                         ImGui.TableSetColumnIndex(2);
-                        GUI.WrappedText(conflict.Type == ParamDeltaMergeConflictType.FieldValue
+                        GUI.WrappedText(conflict.Type is ParamDeltaMergeConflictType.FieldValue or ParamDeltaMergeConflictType.RowName
                             ? $"{conflict.ExistingSource}: {conflict.ExistingValue}"
-                            : $"{conflict.ExistingSource}: {conflict.ExistingState}");
+                            : $"{conflict.ExistingSource}: {conflict.ExistingState}" +
+                              (string.IsNullOrWhiteSpace(conflict.ExistingValue) ? "" : $"\n{conflict.ExistingValue}"));
 
                         ImGui.TableSetColumnIndex(3);
-                        GUI.WrappedText(conflict.Type == ParamDeltaMergeConflictType.FieldValue
+                        GUI.WrappedText(conflict.Type is ParamDeltaMergeConflictType.FieldValue or ParamDeltaMergeConflictType.RowName
                             ? $"{conflict.IncomingSource}: {conflict.IncomingValue}"
-                            : $"{conflict.IncomingSource}: {conflict.IncomingState}");
+                            : $"{conflict.IncomingSource}: {conflict.IncomingState}" +
+                              (string.IsNullOrWhiteSpace(conflict.IncomingValue) ? "" : $"\n{conflict.IncomingValue}"));
 
                         ImGui.TableSetColumnIndex(4);
                         var resolutionLabel = GetParamResolutionName(conflict.Resolution);
@@ -1695,13 +2190,21 @@ public sealed class ParamDeltaAutoMergeTool
                         }
 
                         ImGui.TableSetColumnIndex(5);
-                        if (conflict.Type == ParamDeltaMergeConflictType.FieldValue && conflict.Resolution == ParamDeltaConflictResolution.Manual)
+                        if ((conflict.Type is ParamDeltaMergeConflictType.FieldValue or ParamDeltaMergeConflictType.RowName) &&
+                            conflict.Resolution == ParamDeltaConflictResolution.Manual)
                         {
                             var manual = conflict.ManualValue ?? "";
                             if (ImGui.InputText($"##manualConflict_{idSuffix}_{index}", ref manual, 1024))
                             {
                                 conflict.ManualValue = manual;
                                 Engine.ApplyConflictResolutions(result);
+                            }
+
+                            if (conflict.Type == ParamDeltaMergeConflictType.FieldValue && !conflict.ManualValueValid)
+                            {
+                                GUI.WrappedText(LOC.Get(
+                                    "PARAM_AutoMerge_Manual_Value_Invalid",
+                                    conflict.ManualValueType));
                             }
                         }
                         else
@@ -1710,7 +2213,12 @@ public sealed class ParamDeltaAutoMergeTool
                         }
 
                         ImGui.TableSetColumnIndex(6);
-                        ImGui.Text(conflict.Type == ParamDeltaMergeConflictType.FieldValue ? LOC.Get("PARAM_AutoMerge_ConflictEditor_Field") : LOC.Get("PARAM_AutoMerge_ConflictEditor_RowState"));
+                        ImGui.Text(conflict.Type switch
+                        {
+                            ParamDeltaMergeConflictType.FieldValue => LOC.Get("PARAM_AutoMerge_ConflictEditor_Field"),
+                            ParamDeltaMergeConflictType.RowName => "Row name",
+                            _ => LOC.Get("PARAM_AutoMerge_ConflictEditor_RowState")
+                        });
                         index++;
                     }
 

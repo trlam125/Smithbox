@@ -54,6 +54,16 @@ public sealed class ParamRegulationAutoMerge
     public bool IsSupportedProject => Patcher.Project.Descriptor.ProjectType is
         ProjectType.ER or ProjectType.AC6 or ProjectType.NR or ProjectType.DS3;
 
+    public string RootRegulationRelativePath => Patcher.Project.Descriptor.ProjectType == ProjectType.DS3
+        ? "Data0.bdt"
+        : "regulation.bin";
+
+    public bool IsRootRegulationPath(string relativePath)
+    {
+        var normalized = (relativePath ?? "").Replace('\\', '/').TrimStart('/');
+        return string.Equals(normalized, RootRegulationRelativePath, StringComparison.OrdinalIgnoreCase);
+    }
+
     public string SupportedProjectText => LOC.Get("PARAM_AutoMerge_RegulationMerge_Supported_Hint");
 
     public RegulationMergeAnalysis Analyze(
@@ -131,6 +141,9 @@ public sealed class ParamRegulationAutoMerge
         RegulationMergeAnalysis analysis,
         string outputPath)
     {
+        if (analysis?.MergeResult != null)
+            Engine.ApplyConflictResolutions(analysis.MergeResult);
+
         if (analysis == null || !analysis.CanBuild)
             throw new InvalidOperationException(LOC.Get("PARAM_AutoMerge_Error_Invalid_Regulation_Merge"));
 
@@ -147,6 +160,9 @@ public sealed class ParamRegulationAutoMerge
             if (string.Equals(System.IO.Path.GetFullPath(source.Path), outputFullPath, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException(LOC.Get("PARAM_AutoMerge_Error_Regulation_Output_Collision"));
         }
+
+        if (File.Exists(outputFullPath))
+            throw new InvalidOperationException($"Output file already exists: {outputFullPath}. Choose a new path or remove the existing file first.");
 
         // Always build on the currently loaded game's vanilla regulation. This is important
         // when one or more input regulations were automatically upgraded from an older version.
@@ -171,9 +187,8 @@ public sealed class ParamRegulationAutoMerge
         var originalParamTypes = new Dictionary<string, string>(StringComparer.Ordinal);
         var parsedParams = ParseBinderParams(binder, version, null, strict: false, originalParamTypes);
 
-        // Conflict selections/manual values are edited after analysis in the Auto Merge UI.
-        // Materialize those decisions into the delta immediately before writing the regulation.
-        Engine.ApplyConflictResolutions(analysis.MergeResult);
+        // Conflict selections/manual values were materialized and revalidated before the
+        // build-safety checks above. Apply that final patch to the current vanilla regulation.
         ApplyMergedPatch(parsedParams, analysis.MergeResult.Patch);
 
         foreach (var file in binder.Files)
@@ -221,7 +236,7 @@ public sealed class ParamRegulationAutoMerge
                 }
             }
 
-            File.Move(tempPath, outputFullPath, overwrite: true);
+            File.Move(tempPath, outputFullPath, overwrite: false);
         }
         finally
         {
@@ -321,9 +336,7 @@ public sealed class ParamRegulationAutoMerge
 
     private BND4 ReadCurrentVanillaRegulation()
     {
-        var relativePath = Patcher.Project.Descriptor.ProjectType == ProjectType.DS3
-            ? "Data0.bdt"
-            : "regulation.bin";
+        var relativePath = RootRegulationRelativePath;
 
         var fs = Patcher.Project.VFS.VanillaRealFS;
         if (!fs.FileExists(relativePath))
@@ -513,6 +526,7 @@ public sealed class ParamRegulationAutoMerge
         var currentVanilla = Patcher.Project.Handler.ParamData.VanillaBank.Params;
         var removedParams = 0;
         var removedFields = 0;
+        var redundantDeletedRows = 0;
 
         for (var paramIndex = patch.Params.Count - 1; paramIndex >= 0; paramIndex--)
         {
@@ -529,8 +543,30 @@ public sealed class ParamRegulationAutoMerge
                 .Select(column => column.Def.InternalName)
                 .ToHashSet(StringComparer.Ordinal);
 
-            foreach (var row in paramDelta.Rows)
+            for (var rowIndex = paramDelta.Rows.Count - 1; rowIndex >= 0; rowIndex--)
             {
+                var row = paramDelta.Rows[rowIndex];
+                var currentRow = FindRow(currentParam, row.ID, row.Index);
+
+                if (row.State == RowDeltaState.Modified && currentRow == null)
+                {
+                    throw new InvalidDataException(
+                        $"Automatic upgrade cannot carry forward modified row {paramDelta.Name} {row.ID}:{row.Index} because that row no longer exists in the loaded vanilla regulation.");
+                }
+
+                if (row.State == RowDeltaState.Added && currentRow != null)
+                {
+                    throw new InvalidDataException(
+                        $"Automatic upgrade cannot carry forward added row {paramDelta.Name} {row.ID}:{row.Index} because the loaded vanilla regulation now contains a row at the same identity.");
+                }
+
+                if (row.State == RowDeltaState.Deleted && currentRow == null)
+                {
+                    paramDelta.Rows.RemoveAt(rowIndex);
+                    redundantDeletedRows++;
+                    continue;
+                }
+
                 for (var fieldIndex = row.Fields.Count - 1; fieldIndex >= 0; fieldIndex--)
                 {
                     if (validFields.Contains(row.Fields[fieldIndex].Field))
@@ -539,21 +575,19 @@ public sealed class ParamRegulationAutoMerge
                     row.Fields.RemoveAt(fieldIndex);
                     removedFields++;
                 }
-            }
 
-            paramDelta.Rows.RemoveAll(row =>
-                row.State == RowDeltaState.Modified &&
-                row.Fields.Count == 0 &&
-                string.IsNullOrWhiteSpace(row.Name));
+                if (row.State == RowDeltaState.Modified && row.Fields.Count == 0 && row.Name == null)
+                    paramDelta.Rows.RemoveAt(rowIndex);
+            }
 
             if (paramDelta.Rows.Count == 0)
                 patch.Params.RemoveAt(paramIndex);
         }
 
-        if (removedParams > 0 || removedFields > 0)
+        if (removedParams > 0 || removedFields > 0 || redundantDeletedRows > 0)
         {
             warnings?.Add(
-                LOC.Get("PARAM_AutoMerge_Error_Auto_Upgrade_Skipped_Elements", removedParams, removedFields));
+                $"Automatic upgrade skipped {removedParams} obsolete params, {removedFields} obsolete fields, and {redundantDeletedRows} redundant row deletions that no longer exist in the loaded version.");
         }
     }
 
@@ -604,7 +638,7 @@ public sealed class ParamRegulationAutoMerge
             }
 
             var modified = CreateModifiedRow(sourcePair.Key, sourcePair.Value, vanillaRow);
-            if (modified.Fields.Count > 0 || !string.Equals(sourcePair.Value.Name, vanillaRow.Name, StringComparison.Ordinal))
+            if (modified.Fields.Count > 0 || modified.Name != null)
                 result.Rows.Add(modified);
         }
 
@@ -628,18 +662,13 @@ public sealed class ParamRegulationAutoMerge
     private Dictionary<RowKey, Param.Row> BuildRowMap(Param param)
     {
         var result = new Dictionary<RowKey, Param.Row>();
-        var currentRowID = 0;
-        var internalIndex = 0;
+        var occurrenceById = new Dictionary<int, int>();
 
         foreach (var row in param.Rows)
         {
-            if (row.ID == currentRowID)
-                internalIndex++;
-            else
-                internalIndex = 0;
-
-            result[new RowKey(row.ID, internalIndex)] = row;
-            currentRowID = row.ID;
+            occurrenceById.TryGetValue(row.ID, out var occurrence);
+            result[new RowKey(row.ID, occurrence)] = row;
+            occurrenceById[row.ID] = occurrence + 1;
         }
 
         return result;
@@ -678,7 +707,7 @@ public sealed class ParamRegulationAutoMerge
         {
             ID = key.ID,
             Index = key.Index,
-            Name = row.Name,
+            Name = string.Equals(row.Name, vanillaRow.Name, StringComparison.Ordinal) ? null : row.Name,
             State = RowDeltaState.Modified
         };
 
@@ -773,12 +802,12 @@ public sealed class ParamRegulationAutoMerge
             existing = new Param.Row(template, param)
             {
                 ID = rowDelta.ID,
-                Name = rowDelta.Name
+                Name = rowDelta.Name ?? template.Name
             };
 
             InsertRowAtIdentity(param, existing, rowDelta.ID, rowDelta.Index);
         }
-        else if (!string.IsNullOrWhiteSpace(rowDelta.Name))
+        else if (rowDelta.Name != null)
         {
             existing.Name = rowDelta.Name;
         }
@@ -796,20 +825,16 @@ public sealed class ParamRegulationAutoMerge
 
     private static Param.Row FindRow(Param param, int id, int index)
     {
-        var currentRowID = 0;
-        var internalIndex = 0;
-
+        var occurrence = 0;
         foreach (var row in param.Rows)
         {
-            if (row.ID == currentRowID)
-                internalIndex++;
-            else
-                internalIndex = 0;
+            if (row.ID != id)
+                continue;
 
-            if (row.ID == id && internalIndex == index)
+            if (occurrence == index)
                 return row;
 
-            currentRowID = row.ID;
+            occurrence++;
         }
 
         return null;
